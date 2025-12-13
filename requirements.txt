@@ -1,0 +1,17 @@
+# Granite-Docling-258M RunPod Dependencies
+
+# VLLM for fast inference
+vllm>=0.6.0
+
+# DocTags to HTML conversion
+docling-core
+
+# Image processing
+pillow
+
+# RunPod serverless SDK
+runpod
+
+# Hugging Face libraries (pulled by VLLM but explicit for clarity)
+transformers
+accelerate
