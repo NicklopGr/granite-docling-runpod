@@ -1,5 +1,5 @@
 # Granite-Docling-258M RunPod Serverless Container
-# Uses VLLM for fast inference (~500 tokens/sec)
+# Uses Transformers + Flash Attention 2 for reliable inference
 #
 # Build: docker build -t granite-docling-runpod .
 # Test locally: docker run --gpus all -p 8000:8000 granite-docling-runpod
@@ -21,25 +21,23 @@ RUN apt-get update && apt-get install -y \
 # Upgrade pip
 RUN pip install --upgrade pip
 
-# Install VLLM with CUDA support
-# Note: VLLM 0.6.0+ has better VLM support
-RUN pip install vllm>=0.6.0
+# Install Flash Attention 2 for faster inference
+RUN pip install flash-attn --no-build-isolation
 
-# Install docling-core for DocTags conversion
-RUN pip install docling-core
-
-# Install other dependencies
+# Install core dependencies
 RUN pip install \
+    transformers>=4.40.0 \
+    accelerate \
     pillow \
     runpod \
-    transformers \
-    accelerate
+    docling-core \
+    torch
 
 # Pre-download the model during build (reduces cold start time)
-# Using the "untied" revision for VLLM compatibility
 RUN python -c "\
-from huggingface_hub import snapshot_download; \
-snapshot_download('ibm-granite/granite-docling-258M', revision='untied')"
+from transformers import AutoProcessor, AutoModelForVision2Seq; \
+AutoProcessor.from_pretrained('ibm-granite/granite-docling-258M'); \
+AutoModelForVision2Seq.from_pretrained('ibm-granite/granite-docling-258M')"
 
 # Copy handler
 WORKDIR /app
