@@ -87,3 +87,4 @@ curl -X POST http://localhost:8000/run \
 - Uses `revision="untied"` for VLLM compatibility (tied weights not fully supported)
 - Model is pre-downloaded during Docker build to reduce cold starts
 - Outputs DocTags format natively, converted to HTML by docling-core library
+# Build trigger: Sat Dec 13 23:30:07 PST 2025
