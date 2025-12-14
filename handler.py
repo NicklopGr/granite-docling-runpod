@@ -1,11 +1,13 @@
 """
 Granite-Docling-258M RunPod Serverless Handler
 
-Uses VLLM for fast inference (~500 tokens/sec) with IBM's Granite-Docling model
+Uses VLLM for fast inference with IBM's Granite-Docling model
 for document understanding and table extraction.
 
 API Input: {"input": {"image_base64": "base64_encoded_image"}}
 API Output: {"status": "success", "result": {"doctags": "...", "html": "...", "tables": [...]}}
+
+Reference: https://huggingface.co/ibm-granite/granite-docling-258M
 """
 
 import runpod
@@ -17,8 +19,9 @@ import time
 import traceback
 from PIL import Image
 
-# Global model - loaded once, reused across requests
+# Global model and processor - loaded once, reused across requests
 llm = None
+processor = None
 
 
 def load_model():
@@ -28,26 +31,35 @@ def load_model():
     Note: Using revision="untied" as recommended for VLLM compatibility.
     The main branch uses tied weights which have limited VLLM support.
     """
-    global llm
+    global llm, processor
+
     if llm is None:
         from vllm import LLM
+        from transformers import AutoProcessor
 
         print("[GraniteDocling] Loading model with VLLM...")
         start_time = time.time()
 
+        MODEL_PATH = "ibm-granite/granite-docling-258M"
+
+        # Load processor for chat template formatting
+        processor = AutoProcessor.from_pretrained(MODEL_PATH)
+
+        # Load model with VLLM
         llm = LLM(
-            model="ibm-granite/granite-docling-258M",
+            model=MODEL_PATH,
             revision="untied",  # Required for VLLM compatibility
             dtype="bfloat16",
             trust_remote_code=True,
             gpu_memory_utilization=0.9,
-            max_model_len=4096,
+            max_model_len=8192,
+            limit_mm_per_prompt={"image": 1},  # Required for multimodal
         )
 
         elapsed = time.time() - start_time
         print(f"[GraniteDocling] Model loaded in {elapsed:.2f}s")
 
-    return llm
+    return llm, processor
 
 
 def extract_tables_from_html(html: str) -> list:
@@ -102,34 +114,46 @@ def handler(event):
         image_bytes = base64.b64decode(image_base64)
         image = Image.open(io.BytesIO(image_bytes))
 
-        # Convert to RGB if needed (VLLM requires RGB)
+        # Convert to RGB if needed
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        # Save temp image for VLLM
-        temp_path = f"/tmp/input_image_{os.getpid()}.png"
-        image.save(temp_path)
-        print(f"[GraniteDocling] Image saved: {image.size}")
+        print(f"[GraniteDocling] Image size: {image.size}")
 
-        # Load model
-        model = load_model()
+        # Load model and processor
+        model, proc = load_model()
 
-        # Run inference with VLLM
+        # Run inference with VLLM using proper chat template format
         from vllm import SamplingParams
 
-        prompt = "Convert this page to docling."
+        # Format prompt using processor's chat template (as per HuggingFace docs)
+        PROMPT_TEXT = "Convert this page to docling."
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": PROMPT_TEXT}
+                ]
+            }
+        ]
+
+        # Apply chat template to get properly formatted prompt
+        formatted_prompt = proc.apply_chat_template(messages, add_generation_prompt=True)
+        print(f"[GraniteDocling] Formatted prompt: {formatted_prompt[:100]}...")
+
         sampling_params = SamplingParams(
-            max_tokens=4096,
+            max_tokens=8192,
             temperature=0,
-            stop=["<end_of_utterance>"]
         )
 
         print("[GraniteDocling] Running inference...")
         inference_start = time.time()
 
+        # Use VLLM generate with proper multimodal input format
         outputs = model.generate(
             [{
-                "prompt": f"<|image|>{prompt}",
+                "prompt": formatted_prompt,
                 "multi_modal_data": {"image": image}
             }],
             sampling_params=sampling_params
@@ -140,6 +164,7 @@ def handler(event):
 
         # Extract DocTags output
         doctags = outputs[0].outputs[0].text
+        print(f"[GraniteDocling] Output length: {len(doctags)} chars")
 
         # Convert DocTags to HTML
         print("[GraniteDocling] Converting DocTags to HTML...")
@@ -148,10 +173,6 @@ def handler(event):
         # Extract tables from HTML
         tables = extract_tables_from_html(html_output)
         print(f"[GraniteDocling] Found {len(tables)} tables")
-
-        # Cleanup temp file
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
 
         total_time = time.time() - start_time
 
