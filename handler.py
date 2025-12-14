@@ -1,7 +1,7 @@
 """
 Granite-Docling-258M RunPod Serverless Handler
 
-Uses VLLM for fast inference (~500 tokens/sec) with IBM's Granite-Docling model
+Uses VLLM for fast inference with IBM's Granite-Docling model
 for document understanding and table extraction.
 
 API Input: {"input": {"image_base64": "base64_encoded_image"}}
@@ -19,8 +19,9 @@ import time
 import traceback
 from PIL import Image
 
-# Global model - loaded once, reused across requests
+# Global model and processor - loaded once, reused across requests
 llm = None
+processor = None
 
 
 def load_model():
@@ -29,16 +30,23 @@ def load_model():
 
     Note: Using revision="untied" as recommended for VLLM compatibility.
     """
-    global llm
+    global llm, processor
 
     if llm is None:
         from vllm import LLM
+        from transformers import AutoProcessor
 
         print("[GraniteDocling] Loading model with VLLM...")
         start_time = time.time()
 
+        MODEL_PATH = "ibm-granite/granite-docling-258M"
+
+        # Load processor for proper prompt formatting
+        processor = AutoProcessor.from_pretrained(MODEL_PATH)
+
+        # Load model with VLLM
         llm = LLM(
-            model="ibm-granite/granite-docling-258M",
+            model=MODEL_PATH,
             revision="untied",
             dtype="bfloat16",
             trust_remote_code=True,
@@ -50,7 +58,7 @@ def load_model():
         elapsed = time.time() - start_time
         print(f"[GraniteDocling] Model loaded in {elapsed:.2f}s")
 
-    return llm
+    return llm, processor
 
 
 def extract_tables_from_html(html: str) -> list:
@@ -109,20 +117,31 @@ def handler(event):
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        # Save to temp file - VLLM works better with file paths for some models
+        # Save to temp file
         temp_path = f"/tmp/input_image_{os.getpid()}_{int(time.time())}.png"
         image.save(temp_path)
         print(f"[GraniteDocling] Image saved: {image.size} -> {temp_path}")
 
-        # Load model
-        model = load_model()
+        # Load model and processor
+        model, proc = load_model()
 
         # Run inference with VLLM
         from vllm import SamplingParams
 
-        # Use simple prompt format - VLLM handles image placeholder internally
-        # The <image> token tells VLLM where to insert image features
-        prompt = "<image>Convert this page to docling."
+        # Format prompt using processor's chat template (proper format for this model)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "Convert this page to docling."}
+                ]
+            }
+        ]
+
+        # Apply chat template - this produces the correct prompt with image placeholder
+        prompt = proc.apply_chat_template(messages, add_generation_prompt=True)
+        print(f"[GraniteDocling] Formatted prompt length: {len(prompt)} chars")
 
         sampling_params = SamplingParams(
             max_tokens=8192,
@@ -132,7 +151,7 @@ def handler(event):
         print("[GraniteDocling] Running inference...")
         inference_start = time.time()
 
-        # Pass image as file path - more reliable with VLLM
+        # Pass image as file path
         outputs = model.generate(
             [{
                 "prompt": prompt,
