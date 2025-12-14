@@ -1,11 +1,8 @@
 """
 Granite-Docling-258M RunPod Serverless Handler
 
-Uses Transformers for reliable inference with IBM's Granite-Docling model
+Uses VLLM for fast inference (~500 tokens/sec) with IBM's Granite-Docling model
 for document understanding and table extraction.
-
-Transformers is more reliable than VLLM for multimodal models.
-Speed: ~100 tokens/sec (vs VLLM's ~500 tokens/sec) but guaranteed to work.
 
 API Input: {"input": {"image_base64": "base64_encoded_image"}}
 API Output: {"status": "success", "result": {"doctags": "...", "html": "...", "tables": [...]}}
@@ -20,46 +17,40 @@ import os
 import re
 import time
 import traceback
-import torch
 from PIL import Image
 
-# Global model and processor - loaded once, reused across requests
-model = None
-processor = None
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# Global model - loaded once, reused across requests
+llm = None
 
 
 def load_model():
     """
-    Load Granite-Docling model with Transformers.
+    Load Granite-Docling model with VLLM.
 
-    Using flash_attention_2 on CUDA for better performance.
+    Note: Using revision="untied" as recommended for VLLM compatibility.
     """
-    global model, processor
+    global llm
 
-    if model is None:
-        from transformers import AutoProcessor, AutoModelForVision2Seq
+    if llm is None:
+        from vllm import LLM
 
-        print(f"[GraniteDocling] Loading model with Transformers on {DEVICE}...")
+        print("[GraniteDocling] Loading model with VLLM...")
         start_time = time.time()
 
-        MODEL_PATH = "ibm-granite/granite-docling-258M"
-
-        # Load processor
-        processor = AutoProcessor.from_pretrained(MODEL_PATH)
-
-        # Load model with optimal attention implementation
-        attn_impl = "flash_attention_2" if DEVICE == "cuda" else "sdpa"
-        model = AutoModelForVision2Seq.from_pretrained(
-            MODEL_PATH,
-            torch_dtype=torch.bfloat16,
-            _attn_implementation=attn_impl,
-        ).to(DEVICE)
+        llm = LLM(
+            model="ibm-granite/granite-docling-258M",
+            revision="untied",
+            dtype="bfloat16",
+            trust_remote_code=True,
+            gpu_memory_utilization=0.9,
+            max_model_len=8192,
+            limit_mm_per_prompt={"image": 1},
+        )
 
         elapsed = time.time() - start_time
         print(f"[GraniteDocling] Model loaded in {elapsed:.2f}s")
 
-    return model, processor
+    return llm
 
 
 def extract_tables_from_html(html: str) -> list:
@@ -118,46 +109,43 @@ def handler(event):
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        print(f"[GraniteDocling] Image size: {image.size}")
+        # Save to temp file - VLLM works better with file paths for some models
+        temp_path = f"/tmp/input_image_{os.getpid()}_{int(time.time())}.png"
+        image.save(temp_path)
+        print(f"[GraniteDocling] Image saved: {image.size} -> {temp_path}")
 
-        # Load model and processor
-        mdl, proc = load_model()
+        # Load model
+        model = load_model()
 
-        # Prepare input using chat template (as per HuggingFace docs)
-        PROMPT_TEXT = "Convert this page to docling."
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": PROMPT_TEXT}
-                ]
-            }
-        ]
+        # Run inference with VLLM
+        from vllm import SamplingParams
 
-        # Apply chat template and prepare inputs
-        prompt = proc.apply_chat_template(messages, add_generation_prompt=True)
-        inputs = proc(text=prompt, images=[image], return_tensors="pt").to(DEVICE)
+        # Use simple prompt format - VLLM handles image placeholder internally
+        # The <image> token tells VLLM where to insert image features
+        prompt = "<image>Convert this page to docling."
+
+        sampling_params = SamplingParams(
+            max_tokens=8192,
+            temperature=0,
+        )
 
         print("[GraniteDocling] Running inference...")
         inference_start = time.time()
 
-        # Generate with Transformers
-        with torch.no_grad():
-            generated_ids = mdl.generate(
-                **inputs,
-                max_new_tokens=8192,
-                do_sample=False,
-            )
+        # Pass image as file path - more reliable with VLLM
+        outputs = model.generate(
+            [{
+                "prompt": prompt,
+                "multi_modal_data": {"image": temp_path}
+            }],
+            sampling_params=sampling_params
+        )
 
         inference_time = time.time() - inference_start
         print(f"[GraniteDocling] Inference completed in {inference_time:.2f}s")
 
-        # Decode output
-        # Remove input tokens from output
-        generated_ids = generated_ids[:, inputs["input_ids"].shape[1]:]
-        doctags = proc.batch_decode(generated_ids, skip_special_tokens=True)[0]
-
+        # Extract DocTags output
+        doctags = outputs[0].outputs[0].text
         print(f"[GraniteDocling] Output length: {len(doctags)} chars")
 
         # Convert DocTags to HTML
@@ -168,11 +156,11 @@ def handler(event):
         tables = extract_tables_from_html(html_output)
         print(f"[GraniteDocling] Found {len(tables)} tables")
 
-        total_time = time.time() - start_time
+        # Cleanup temp file
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
-        # Clear GPU cache to prevent memory buildup
-        if DEVICE == "cuda":
-            torch.cuda.empty_cache()
+        total_time = time.time() - start_time
 
         return {
             "status": "success",
@@ -182,7 +170,6 @@ def handler(event):
                 "tables": tables,
                 "metadata": {
                     "model": "granite-docling-258M",
-                    "device": DEVICE,
                     "inference_time_seconds": round(inference_time, 2),
                     "total_time_seconds": round(total_time, 2),
                     "table_count": len(tables)
@@ -193,11 +180,6 @@ def handler(event):
     except Exception as e:
         print(f"[GraniteDocling] Error: {e}")
         traceback.print_exc()
-
-        # Clear GPU cache on error
-        if DEVICE == "cuda":
-            torch.cuda.empty_cache()
-
         return {
             "status": "error",
             "error": str(e),
@@ -208,8 +190,4 @@ def handler(event):
 # Start RunPod serverless
 if __name__ == "__main__":
     print("[GraniteDocling] Starting RunPod serverless handler...")
-    print(f"[GraniteDocling] Device: {DEVICE}")
-    print(f"[GraniteDocling] CUDA available: {torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        print(f"[GraniteDocling] GPU: {torch.cuda.get_device_name(0)}")
     runpod.serverless.start({"handler": handler})

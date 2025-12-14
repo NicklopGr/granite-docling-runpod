@@ -1,11 +1,7 @@
 # Granite-Docling-258M RunPod Dependencies
 
-# Transformers for reliable inference (VLLM has multimodal issues)
-transformers>=4.40.0
-accelerate
-
-# Flash Attention for faster inference
-flash-attn
+# VLLM for fast inference (~500 tokens/sec)
+vllm>=0.6.0
 
 # DocTags to HTML conversion
 docling-core
@@ -16,5 +12,6 @@ pillow
 # RunPod serverless SDK
 runpod
 
-# PyTorch (should come with base image but explicit)
-torch
+# Hugging Face libraries
+transformers
+accelerate
