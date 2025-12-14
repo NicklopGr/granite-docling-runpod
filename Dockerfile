@@ -1,5 +1,5 @@
 # Granite-Docling-258M RunPod Serverless Container
-# Uses VLLM for fast inference (~500 tokens/sec)
+# Uses IBM Docling SDK with VlmPipeline for production-quality document understanding
 #
 # Build: docker build -t granite-docling-runpod .
 # Test locally: docker run --gpus all -p 8000:8000 granite-docling-runpod
@@ -10,6 +10,7 @@ FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV HF_HOME=/root/.cache/huggingface
+ENV DOCLING_DEVICE=cuda
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -21,24 +22,20 @@ RUN apt-get update && apt-get install -y \
 # Upgrade pip
 RUN pip install --upgrade pip
 
-# Install VLLM with CUDA support
-RUN pip install vllm>=0.6.0
+# Install Docling with VLM support (IBM production approach)
+RUN pip install "docling[vlm]"
 
-# Install docling-core for DocTags conversion
-RUN pip install docling-core
-
-# Install other dependencies
+# Install additional dependencies
 RUN pip install \
     pillow \
     runpod \
-    transformers \
     accelerate
 
-# Pre-download the model during build (reduces cold start time)
-# Using the "untied" revision for VLLM compatibility
+# Pre-download the Granite-Docling model during build (reduces cold start time)
 RUN python -c "\
 from huggingface_hub import snapshot_download; \
-snapshot_download('ibm-granite/granite-docling-258M', revision='untied')"
+snapshot_download('ibm-granite/granite-docling-258M'); \
+print('Granite-Docling-258M downloaded successfully')"
 
 # Copy handler
 WORKDIR /app

@@ -1,13 +1,13 @@
 # Granite-Docling-258M RunPod Serverless
 
-RunPod serverless endpoint for IBM's [Granite-Docling-258M](https://huggingface.co/ibm-granite/granite-docling-258M) vision-language model.
+Production-quality document understanding using IBM's Granite-Docling-258M with the official Docling SDK VlmPipeline.
 
 ## Features
 
-- **VLLM inference**: ~500 tokens/sec (100x faster than transformers)
-- **DocTags to HTML**: Automatic conversion for easy downstream processing
-- **Table extraction**: Extracts HTML tables from documents
-- **Pre-loaded model**: Reduces cold start time
+- **97% Table TEDS Accuracy**: Best-in-class table structure recognition
+- **IBM Production Approach**: Uses official Docling SDK with VlmPipeline
+- **GPU Accelerated**: CUDA support for fast inference
+- **RunPod Serverless**: Auto-scaling with webhook deployment
 
 ## Model Specs
 
@@ -17,7 +17,7 @@ RunPod serverless endpoint for IBM's [Granite-Docling-258M](https://huggingface.
 | Table TEDS (structure) | 97% |
 | Table TEDS (content) | 96% |
 | Full-page OCR F1 | 0.84 |
-| VRAM Usage | ~2GB |
+| VRAM Usage | ~4GB |
 
 ## API
 
@@ -25,7 +25,7 @@ RunPod serverless endpoint for IBM's [Granite-Docling-258M](https://huggingface.
 ```json
 {
   "input": {
-    "image_base64": "base64_encoded_image_string"
+    "pdf_base64": "base64_encoded_pdf_content"
   }
 }
 ```
@@ -35,40 +35,48 @@ RunPod serverless endpoint for IBM's [Granite-Docling-258M](https://huggingface.
 {
   "status": "success",
   "result": {
-    "doctags": "raw DocTags output",
-    "html": "converted HTML",
+    "markdown": "# Document Title\n\n| Col1 | Col2 |\n|---|---|\n| A | B |",
     "tables": [
-      {"table_number": 1, "html": "<table>...</table>"}
+      {
+        "table_number": 1,
+        "markdown": "| Col1 | Col2 |\n|---|---|\n| A | B |",
+        "row_count": 2
+      }
+    ],
+    "text_content": [
+      {"text": "Document Title", "type": "title"},
+      {"text": "Paragraph text...", "type": "paragraph"}
     ],
     "metadata": {
       "model": "granite-docling-258M",
-      "inference_time_seconds": 2.5,
-      "total_time_seconds": 3.2,
-      "table_count": 2
+      "pipeline": "VlmPipeline",
+      "inference_time_seconds": 5.2,
+      "total_time_seconds": 6.1,
+      "table_count": 3,
+      "text_items": 25
     }
   }
 }
 ```
 
+## Architecture
+
+```
+PDF → Docling SDK → VlmPipeline → Granite-Docling-258M → DocTags → Markdown/Tables
+```
+
+This uses the IBM-recommended production approach:
+1. **Docling SDK**: Official document processing library
+2. **VlmPipeline**: Vision-Language Model pipeline for 97% accuracy
+3. **Granite-Docling-258M**: Compact 258M parameter VLM optimized for documents
+
 ## Deployment
 
-### Build Docker Image
-```bash
-docker build -t granite-docling-runpod .
-```
+This repo is connected to RunPod with webhook auto-build. Push to main triggers automatic deployment.
 
-### Push to Docker Hub
 ```bash
-docker tag granite-docling-runpod your-dockerhub/granite-docling-runpod:latest
-docker push your-dockerhub/granite-docling-runpod:latest
+git add -A && git commit -m "Update message" && git push
 ```
-
-### Create RunPod Endpoint
-1. Go to [RunPod Console](https://www.runpod.io/console/serverless)
-2. Create new endpoint
-3. Use Docker image: `your-dockerhub/granite-docling-runpod:latest`
-4. GPU: RTX 4090 or A100 (24GB+ VRAM recommended)
-5. Save endpoint ID for backend integration
 
 ## Local Testing
 
@@ -76,16 +84,14 @@ docker push your-dockerhub/granite-docling-runpod:latest
 # Run container locally
 docker run --gpus all -p 8000:8000 granite-docling-runpod
 
-# Test with curl
+# Test with curl (PDF must be base64 encoded)
 curl -X POST http://localhost:8000/run \
   -H "Content-Type: application/json" \
-  -d '{"input": {"image_base64": "YOUR_BASE64_IMAGE"}}'
+  -d '{"input": {"pdf_base64": "YOUR_BASE64_PDF"}}'
 ```
 
-## Notes
+## References
 
-- Uses `revision="untied"` for VLLM compatibility (tied weights not fully supported)
-- Model is pre-downloaded during Docker build to reduce cold starts
-- Outputs DocTags format natively, converted to HTML by docling-core library
-# Build trigger: Sat Dec 13 23:30:07 PST 2025
-# Build test: Sun Dec 14 00:44:15 PST 2025
+- [Granite-Docling-258M on HuggingFace](https://huggingface.co/ibm-granite/granite-docling-258M)
+- [Docling VLM Pipeline Example](https://docling-project.github.io/docling/examples/minimal_vlm_pipeline/)
+- [IBM Announcement](https://www.ibm.com/new/announcements/granite-docling-end-to-end-document-conversion)

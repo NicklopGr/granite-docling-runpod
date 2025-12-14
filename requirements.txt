@@ -1,10 +1,8 @@
 # Granite-Docling-258M RunPod Dependencies
+# Uses IBM Docling SDK with VlmPipeline (production approach)
 
-# VLLM for fast inference (~500 tokens/sec)
-vllm>=0.6.0
-
-# DocTags to HTML conversion
-docling-core
+# Docling with VLM support
+docling[vlm]
 
 # Image processing
 pillow
@@ -13,5 +11,4 @@ pillow
 runpod
 
 # Hugging Face libraries
-transformers
 accelerate

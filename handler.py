@@ -1,13 +1,15 @@
 """
 Granite-Docling-258M RunPod Serverless Handler
 
-Uses VLLM for fast inference with IBM's Granite-Docling model
-for document understanding and table extraction.
+Uses IBM Docling SDK with VlmPipeline for production-quality document understanding.
+This is the recommended approach per IBM documentation.
 
-API Input: {"input": {"image_base64": "base64_encoded_image"}}
-API Output: {"status": "success", "result": {"doctags": "...", "html": "...", "tables": [...]}}
+API Input: {"input": {"pdf_base64": "base64_encoded_pdf"}}
+API Output: {"status": "success", "result": {"markdown": "...", "tables": [...], "text_content": [...]}}
 
-Reference: https://huggingface.co/ibm-granite/granite-docling-258M
+Reference:
+- https://huggingface.co/ibm-granite/granite-docling-258M
+- https://docling-project.github.io/docling/examples/minimal_vlm_pipeline/
 """
 
 import runpod
@@ -16,151 +18,155 @@ import io
 import os
 import re
 import time
+import tempfile
 import traceback
-from PIL import Image
 
-# Global model - loaded once, reused across requests
-llm = None
+# Global converter - loaded once, reused across requests
+converter = None
 
 
-def load_model():
+def load_converter():
     """
-    Load Granite-Docling model with VLLM.
+    Load Docling DocumentConverter with VlmPipeline for Granite-Docling.
+    This uses the IBM production-recommended approach.
     """
-    global llm
+    global converter
 
-    if llm is None:
-        from vllm import LLM
+    if converter is None:
+        from docling.datamodel.base_models import InputFormat
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from docling.pipeline.vlm_pipeline import VlmPipeline
 
-        print("[GraniteDocling] Loading model with VLLM...")
+        print("[GraniteDocling] Loading Docling with VlmPipeline...")
         start_time = time.time()
 
-        MODEL_PATH = "ibm-granite/granite-docling-258M"
-
-        llm = LLM(
-            model=MODEL_PATH,
-            revision="untied",
-            dtype="bfloat16",
-            trust_remote_code=True,
-            gpu_memory_utilization=0.9,
-            max_model_len=8192,
-            limit_mm_per_prompt={"image": 1},
+        # Create converter with VlmPipeline (uses Granite-Docling by default)
+        converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(
+                    pipeline_cls=VlmPipeline,
+                ),
+            }
         )
 
         elapsed = time.time() - start_time
-        print(f"[GraniteDocling] Model loaded in {elapsed:.2f}s")
+        print(f"[GraniteDocling] Converter loaded in {elapsed:.2f}s")
 
-    return llm
+    return converter
 
 
-def extract_tables_from_html(html: str) -> list:
-    """Extract table HTML segments from full document HTML."""
-    if not html:
+def extract_tables_from_markdown(markdown: str) -> list:
+    """Extract table sections from markdown content."""
+    if not markdown:
         return []
 
-    tables = re.findall(r'<table[^>]*>.*?</table>', html, re.DOTALL | re.IGNORECASE)
-    return [{"table_number": i + 1, "html": t} for i, t in enumerate(tables)]
+    tables = []
+    # Find markdown tables (lines starting with |)
+    lines = markdown.split('\n')
+    current_table = []
+    table_num = 0
 
+    for line in lines:
+        if line.strip().startswith('|'):
+            current_table.append(line)
+        elif current_table:
+            # End of table
+            table_num += 1
+            tables.append({
+                "table_number": table_num,
+                "markdown": '\n'.join(current_table),
+                "row_count": len([l for l in current_table if l.strip().startswith('|') and '---' not in l])
+            })
+            current_table = []
 
-def convert_doctags_to_html(doctags: str) -> str:
-    """
-    Convert DocTags format to HTML.
-    """
-    try:
-        from docling_core.types.doc.document import DocTagsDocument
-        doc = DocTagsDocument.from_doctags(doctags)
-        html = doc.export_to_html()
-        return html
-    except ImportError:
-        print("[GraniteDocling] docling-core not available, returning raw doctags")
-        return f"<pre>{doctags}</pre>"
-    except Exception as e:
-        print(f"[GraniteDocling] DocTags conversion error: {e}")
-        return f"<pre>{doctags}</pre>"
+    # Handle last table if exists
+    if current_table:
+        table_num += 1
+        tables.append({
+            "table_number": table_num,
+            "markdown": '\n'.join(current_table),
+            "row_count": len([l for l in current_table if l.strip().startswith('|') and '---' not in l])
+        })
+
+    return tables
 
 
 def handler(event):
     """
-    RunPod serverless handler for Granite-Docling inference.
+    RunPod serverless handler for Granite-Docling inference using Docling SDK.
     """
     start_time = time.time()
 
     try:
         input_data = event.get("input", {})
-        image_base64 = input_data.get("image_base64")
+        pdf_base64 = input_data.get("pdf_base64")
 
-        if not image_base64:
-            return {"status": "error", "error": "No image_base64 provided"}
+        if not pdf_base64:
+            return {"status": "error", "error": "No pdf_base64 provided"}
 
-        # Decode image
-        print("[GraniteDocling] Decoding image...")
-        image_bytes = base64.b64decode(image_base64)
-        image = Image.open(io.BytesIO(image_bytes))
+        # Decode PDF
+        print("[GraniteDocling] Decoding PDF...")
+        pdf_bytes = base64.b64decode(pdf_base64)
+        print(f"[GraniteDocling] PDF size: {len(pdf_bytes)} bytes")
 
-        # Convert to RGB if needed
-        if image.mode != "RGB":
-            image = image.convert("RGB")
+        # Save to temp file (Docling requires file path)
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_file:
+            tmp_file.write(pdf_bytes)
+            tmp_path = tmp_file.name
 
-        print(f"[GraniteDocling] Image size: {image.size}")
+        try:
+            # Load converter
+            doc_converter = load_converter()
 
-        # Load model
-        model = load_model()
+            # Convert document
+            print("[GraniteDocling] Converting document with VlmPipeline...")
+            inference_start = time.time()
 
-        from vllm import SamplingParams
+            result = doc_converter.convert(source=tmp_path)
+            doc = result.document
 
-        # Simple prompt with single image placeholder
-        # Using format similar to other VLMs that work with VLLM
-        prompt = "User:<image>Convert this page to docling.\nAssistant:"
+            inference_time = time.time() - inference_start
+            print(f"[GraniteDocling] Conversion completed in {inference_time:.2f}s")
 
-        sampling_params = SamplingParams(
-            max_tokens=8192,
-            temperature=0,
-        )
+            # Export to markdown
+            markdown = doc.export_to_markdown()
+            print(f"[GraniteDocling] Markdown length: {len(markdown)} chars")
 
-        print(f"[GraniteDocling] Prompt: {prompt}")
-        print("[GraniteDocling] Running inference...")
-        inference_start = time.time()
+            # Extract tables
+            tables = extract_tables_from_markdown(markdown)
+            print(f"[GraniteDocling] Found {len(tables)} tables")
 
-        # Pass PIL image directly
-        outputs = model.generate(
-            [{
-                "prompt": prompt,
-                "multi_modal_data": {"image": image}
-            }],
-            sampling_params=sampling_params
-        )
+            # Extract text content
+            text_content = []
+            for item in doc.texts:
+                text_content.append({
+                    "text": item.text if hasattr(item, 'text') else str(item),
+                    "type": item.label if hasattr(item, 'label') else "text"
+                })
 
-        inference_time = time.time() - inference_start
-        print(f"[GraniteDocling] Inference completed in {inference_time:.2f}s")
+            total_time = time.time() - start_time
 
-        # Extract DocTags output
-        doctags = outputs[0].outputs[0].text
-        print(f"[GraniteDocling] Output length: {len(doctags)} chars")
-
-        # Convert DocTags to HTML
-        print("[GraniteDocling] Converting DocTags to HTML...")
-        html_output = convert_doctags_to_html(doctags)
-
-        # Extract tables from HTML
-        tables = extract_tables_from_html(html_output)
-        print(f"[GraniteDocling] Found {len(tables)} tables")
-
-        total_time = time.time() - start_time
-
-        return {
-            "status": "success",
-            "result": {
-                "doctags": doctags,
-                "html": html_output,
-                "tables": tables,
-                "metadata": {
-                    "model": "granite-docling-258M",
-                    "inference_time_seconds": round(inference_time, 2),
-                    "total_time_seconds": round(total_time, 2),
-                    "table_count": len(tables)
+            return {
+                "status": "success",
+                "result": {
+                    "markdown": markdown,
+                    "tables": tables,
+                    "text_content": text_content,
+                    "metadata": {
+                        "model": "granite-docling-258M",
+                        "pipeline": "VlmPipeline",
+                        "inference_time_seconds": round(inference_time, 2),
+                        "total_time_seconds": round(total_time, 2),
+                        "table_count": len(tables),
+                        "text_items": len(text_content)
+                    }
                 }
             }
-        }
+
+        finally:
+            # Clean up temp file
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
     except Exception as e:
         print(f"[GraniteDocling] Error: {e}")
@@ -173,5 +179,5 @@ def handler(event):
 
 
 if __name__ == "__main__":
-    print("[GraniteDocling] Starting RunPod serverless handler...")
+    print("[GraniteDocling] Starting RunPod serverless handler with Docling SDK...")
     runpod.serverless.start({"handler": handler})
