@@ -88,3 +88,4 @@ curl -X POST http://localhost:8000/run \
 - Model is pre-downloaded during Docker build to reduce cold starts
 - Outputs DocTags format natively, converted to HTML by docling-core library
 # Build trigger: Sat Dec 13 23:30:07 PST 2025
+# Build test: Sun Dec 14 00:44:15 PST 2025
