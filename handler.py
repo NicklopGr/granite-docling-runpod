@@ -17,7 +17,7 @@ Reference:
 - https://docling-project.github.io/docling/examples/minimal_vlm_pipeline/
 - https://docling-project.github.io/docling/examples/gpu_vlm_pipeline/
 
-Build: 2025-12-15-v2 (force rebuild for flash-attn CUDA support)
+Build: 2025-12-15-v4 (VLLM variant with untied revision for stability)
 """
 
 import runpod
@@ -56,7 +56,7 @@ def load_converter():
         from docling.pipeline.vlm_pipeline import VlmPipeline
 
         print("[GraniteDocling] Loading Docling with VlmPipeline...")
-        print("[GraniteDocling] Using GRANITEDOCLING_TRANSFORMERS model spec")
+        print("[GraniteDocling] Using GRANITEDOCLING_VLLM model spec (revision='untied')")
         start_time = time.time()
 
         # Check if flash_attn is available
@@ -65,8 +65,8 @@ def load_converter():
 
         # Configure VLM pipeline with explicit model and GPU acceleration
         pipeline_options = VlmPipelineOptions(
-            # Explicitly use Granite-Docling with Transformers framework
-            vlm_options=vlm_model_specs.GRANITEDOCLING_TRANSFORMERS,
+            # Use VLLM variant with "untied" revision (fixes stability issues, 50-100x faster)
+            vlm_options=vlm_model_specs.GRANITEDOCLING_VLLM,
             # Generate page images for better table extraction
             generate_page_images=True,
             # Configure GPU acceleration (only enable flash_attn if available)
@@ -238,6 +238,6 @@ def handler(event):
 
 if __name__ == "__main__":
     print("[GraniteDocling] Starting RunPod serverless handler with Docling SDK...")
-    print("[GraniteDocling] Model: GRANITEDOCLING_TRANSFORMERS")
+    print("[GraniteDocling] Model: GRANITEDOCLING_VLLM (revision='untied')")
     print("[GraniteDocling] Accelerator: CUDA with flash_attention_2")
     runpod.serverless.start({"handler": handler})
