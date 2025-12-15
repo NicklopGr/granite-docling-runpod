@@ -17,7 +17,7 @@ Reference:
 - https://docling-project.github.io/docling/examples/minimal_vlm_pipeline/
 - https://docling-project.github.io/docling/examples/gpu_vlm_pipeline/
 
-Build: 2025-12-15-v9 (Comprehensive logging and validation)
+Build: 2025-12-15-v10 (Fixed max_tokens config)
 """
 
 import runpod
@@ -153,7 +153,7 @@ def load_converter():
             url="http://localhost:8001/v1/chat/completions",
             params=dict(
                 model="ibm-granite/granite-docling-258M",
-                max_tokens=8192,
+                max_tokens=4096,  # Leave room for input (model max context: 8192 total)
                 skip_special_tokens=False,  # CRITICAL for DOCTAGS parsing
             ),
             headers={},
