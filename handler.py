@@ -17,7 +17,7 @@ Reference:
 - https://docling-project.github.io/docling/examples/minimal_vlm_pipeline/
 - https://docling-project.github.io/docling/examples/gpu_vlm_pipeline/
 
-Build: 2025-12-15-v10 (Fixed max_tokens config)
+Build: 2025-12-15-v11 (Added base64 validation logging)
 """
 
 import runpod
@@ -85,6 +85,7 @@ def check_vllm_health():
 def setup_api_logging():
     """Monkey-patch requests to log all vLLM API calls."""
     import requests
+    import re
     original_post = requests.post
 
     def logged_post(url, *args, **kwargs):
@@ -102,6 +103,31 @@ def setup_api_logging():
                                 if item.get('type') == 'image_url':
                                     url_str = item['image_url']['url']
                                     if url_str.startswith('data:'):
+                                        # Validate base64 encoding
+                                        parts = url_str.split(',', 1)
+                                        if len(parts) == 2:
+                                            header, b64_data = parts
+                                            logger.info(f"[Base64 Validation] Data URI header: {header}")
+                                            logger.info(f"[Base64 Validation] Base64 length: {len(b64_data)} chars")
+                                            logger.info(f"[Base64 Validation] First 100 chars: {b64_data[:100]}")
+                                            logger.info(f"[Base64 Validation] Last 50 chars: {b64_data[-50:]}")
+
+                                            # Check for invalid characters
+                                            invalid_chars = re.findall(r'[^A-Za-z0-9+/=]', b64_data)
+                                            if invalid_chars:
+                                                logger.error(f"[Base64 Validation] INVALID CHARACTERS FOUND: {set(invalid_chars)}")
+                                                logger.error(f"[Base64 Validation] Character positions: {[(c, b64_data.index(c)) for c in set(invalid_chars)]}")
+                                            else:
+                                                logger.info(f"[Base64 Validation] Base64 string appears valid (no invalid chars)")
+
+                                            # Check for common issues
+                                            if '\n' in b64_data or '\r' in b64_data:
+                                                logger.error(f"[Base64 Validation] Contains newlines!")
+                                            if ' ' in b64_data:
+                                                logger.error(f"[Base64 Validation] Contains spaces!")
+                                        else:
+                                            logger.error(f"[Base64 Validation] Data URI format invalid: {url_str[:100]}")
+
                                         item['image_url']['url'] = f"data:image/png;base64,...({len(url_str)} chars)"
                 logger.info(f"Request: {json.dumps(req_data, indent=2)}")
 
