@@ -11,6 +11,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV HF_HOME=/root/.cache/huggingface
 ENV DOCLING_DEVICE=cuda
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -19,12 +22,13 @@ RUN apt-get update && apt-get install -y \
     poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip
-RUN pip install --upgrade pip
+# Upgrade pip and build tools
+RUN pip install --upgrade pip setuptools wheel
 
 # Install flash-attn for CUDA acceleration (requires ninja for build)
-RUN pip install ninja packaging
-RUN pip install flash-attn --no-build-isolation || echo "flash-attn installation failed, will use standard attention"
+# Use MAX_JOBS to speed up compilation
+RUN pip install ninja packaging && \
+    MAX_JOBS=4 pip install flash-attn --no-build-isolation
 
 # Install Docling with VLM support (IBM production approach)
 # Use latest version 2.64.1 (Dec 2025) with all bug fixes
