@@ -17,7 +17,7 @@ Reference:
 - https://docling-project.github.io/docling/examples/minimal_vlm_pipeline/
 - https://docling-project.github.io/docling/examples/gpu_vlm_pipeline/
 
-Build: 2025-12-15-v11 (Added base64 validation logging)
+Build: 2025-12-15-v12 (Fix RGBA to RGB conversion for vLLM)
 """
 
 import runpod
@@ -83,9 +83,11 @@ def check_vllm_health():
 
 
 def setup_api_logging():
-    """Monkey-patch requests to log all vLLM API calls."""
+    """Monkey-patch requests to log all vLLM API calls and convert RGBA to RGB."""
     import requests
     import re
+    from PIL import Image
+    import io
     original_post = requests.post
 
     def logged_post(url, *args, **kwargs):
@@ -93,7 +95,7 @@ def setup_api_logging():
             logger.info(f"=== vLLM API Request ===")
             logger.info(f"URL: {url}")
 
-            # Log request body (truncate images)
+            # Log request body (truncate images) and fix RGBA issue
             if 'json' in kwargs:
                 req_data = kwargs['json'].copy()
                 if 'messages' in req_data:
@@ -125,10 +127,43 @@ def setup_api_logging():
                                                 logger.error(f"[Base64 Validation] Contains newlines!")
                                             if ' ' in b64_data:
                                                 logger.error(f"[Base64 Validation] Contains spaces!")
+
+                                            # FIX: Convert RGBA to RGB for vLLM compatibility
+                                            try:
+                                                img_bytes = base64.b64decode(b64_data)
+                                                img = Image.open(io.BytesIO(img_bytes))
+                                                logger.info(f"[Image Fix] Original format: {img.mode}, size: {img.size}")
+
+                                                if img.mode == 'RGBA':
+                                                    logger.warning(f"[Image Fix] Converting RGBA to RGB (vLLM doesn't support RGBA)")
+                                                    # Create white background
+                                                    rgb_img = Image.new('RGB', img.size, (255, 255, 255))
+                                                    # Paste RGBA image onto white background
+                                                    rgb_img.paste(img, mask=img.split()[3])  # Use alpha channel as mask
+
+                                                    # Re-encode as base64
+                                                    buffer = io.BytesIO()
+                                                    rgb_img.save(buffer, format='PNG')
+                                                    new_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+
+                                                    # Update the request
+                                                    item['image_url']['url'] = f"data:image/png;base64,{new_b64}"
+                                                    logger.info(f"[Image Fix] Converted to RGB, new base64 length: {len(new_b64)}")
+
+                                                    # Update for logging
+                                                    url_str = item['image_url']['url']
+                                                    b64_data = new_b64
+                                            except Exception as e:
+                                                logger.error(f"[Image Fix] Failed to convert image: {e}")
+
                                         else:
                                             logger.error(f"[Base64 Validation] Data URI format invalid: {url_str[:100]}")
 
-                                        item['image_url']['url'] = f"data:image/png;base64,...({len(url_str)} chars)"
+                                        # Update original request with fixed image
+                                        kwargs['json'] = req_data
+
+                                        # Log truncated version
+                                        item['image_url']['url'] = f"data:image/png;base64,...({len(b64_data)} chars)"
                 logger.info(f"Request: {json.dumps(req_data, indent=2)}")
 
         response = original_post(url, *args, **kwargs)
