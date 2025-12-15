@@ -157,10 +157,8 @@ def handler(event):
             print("[GraniteDocling] Config: max_num_pages=None (process all pages)")
             inference_start = time.time()
 
-            result = doc_converter.convert(
-                source=tmp_path,
-                max_num_pages=None  # Process ALL pages
-            )
+            # Convert document (no max_num_pages parameter = process all pages)
+            result = doc_converter.convert(source=tmp_path)
             doc = result.document
 
             inference_time = time.time() - inference_start
