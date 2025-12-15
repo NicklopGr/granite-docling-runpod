@@ -34,8 +34,7 @@ RUN pip install "docling[vlm]==2.64.1"
 RUN pip install \
     pillow \
     runpod \
-    accelerate \
-    pypdf
+    accelerate
 
 # Pre-download the Granite-Docling model during build (reduces cold start time)
 RUN python -c "\
