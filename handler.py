@@ -4,19 +4,23 @@ Granite-Docling-258M RunPod Serverless Handler
 Uses IBM Docling SDK with VlmPipeline for production-quality document understanding.
 This is the recommended approach per IBM documentation.
 
+Key Configuration:
+- vlm_model_specs.GRANITEDOCLING_TRANSFORMERS for explicit model selection
+- CUDA acceleration with flash_attention_2
+- generate_page_images=True for better table extraction
+
 API Input: {"input": {"pdf_base64": "base64_encoded_pdf"}}
 API Output: {"status": "success", "result": {"markdown": "...", "tables": [...], "text_content": [...]}}
 
 Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
 - https://docling-project.github.io/docling/examples/minimal_vlm_pipeline/
+- https://docling-project.github.io/docling/examples/gpu_vlm_pipeline/
 """
 
 import runpod
 import base64
-import io
 import os
-import re
 import time
 import tempfile
 import traceback
@@ -28,23 +32,41 @@ converter = None
 def load_converter():
     """
     Load Docling DocumentConverter with VlmPipeline for Granite-Docling.
-    This uses the IBM production-recommended approach.
+    Uses explicit model specification and GPU acceleration.
     """
     global converter
 
     if converter is None:
+        from docling.datamodel import vlm_model_specs
         from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import VlmPipelineOptions
+        from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
         from docling.document_converter import DocumentConverter, PdfFormatOption
         from docling.pipeline.vlm_pipeline import VlmPipeline
 
         print("[GraniteDocling] Loading Docling with VlmPipeline...")
+        print("[GraniteDocling] Using GRANITEDOCLING_TRANSFORMERS model spec")
         start_time = time.time()
 
-        # Create converter with VlmPipeline (uses Granite-Docling by default)
+        # Configure VLM pipeline with explicit model and GPU acceleration
+        pipeline_options = VlmPipelineOptions(
+            # Explicitly use Granite-Docling with Transformers framework
+            vlm_options=vlm_model_specs.GRANITEDOCLING_TRANSFORMERS,
+            # Generate page images for better table extraction
+            generate_page_images=True,
+            # Configure GPU acceleration
+            accelerator_options=AcceleratorOptions(
+                device=AcceleratorDevice.CUDA,
+                cuda_use_flash_attention2=True,
+            ),
+        )
+
+        # Create converter with VlmPipeline
         converter = DocumentConverter(
             format_options={
                 InputFormat.PDF: PdfFormatOption(
                     pipeline_cls=VlmPipeline,
+                    pipeline_options=pipeline_options,
                 ),
             }
         )
@@ -61,7 +83,6 @@ def extract_tables_from_markdown(markdown: str) -> list:
         return []
 
     tables = []
-    # Find markdown tables (lines starting with |)
     lines = markdown.split('\n')
     current_table = []
     table_num = 0
@@ -132,17 +153,33 @@ def handler(event):
             markdown = doc.export_to_markdown()
             print(f"[GraniteDocling] Markdown length: {len(markdown)} chars")
 
-            # Extract tables
-            tables = extract_tables_from_markdown(markdown)
+            # Extract tables from document structure (more accurate than parsing markdown)
+            tables = []
+            if hasattr(doc, 'tables') and doc.tables:
+                for i, table in enumerate(doc.tables):
+                    table_md = table.export_to_markdown() if hasattr(table, 'export_to_markdown') else str(table)
+                    tables.append({
+                        "table_number": i + 1,
+                        "markdown": table_md,
+                        "row_count": table_md.count('\n') if table_md else 0
+                    })
+            else:
+                # Fallback to extracting from markdown
+                tables = extract_tables_from_markdown(markdown)
+
             print(f"[GraniteDocling] Found {len(tables)} tables")
 
-            # Extract text content
+            # Extract text content with proper labels
             text_content = []
-            for item in doc.texts:
-                text_content.append({
-                    "text": item.text if hasattr(item, 'text') else str(item),
-                    "type": item.label if hasattr(item, 'label') else "text"
-                })
+            if hasattr(doc, 'texts'):
+                for item in doc.texts:
+                    text_content.append({
+                        "text": item.text if hasattr(item, 'text') else str(item),
+                        "type": str(item.label) if hasattr(item, 'label') else "text"
+                    })
+
+            # Get page count
+            page_count = len(doc.pages) if hasattr(doc, 'pages') else 0
 
             total_time = time.time() - start_time
 
@@ -155,10 +192,13 @@ def handler(event):
                     "metadata": {
                         "model": "granite-docling-258M",
                         "pipeline": "VlmPipeline",
+                        "framework": "transformers",
+                        "accelerator": "cuda",
                         "inference_time_seconds": round(inference_time, 2),
                         "total_time_seconds": round(total_time, 2),
                         "table_count": len(tables),
-                        "text_items": len(text_content)
+                        "text_items": len(text_content),
+                        "page_count": page_count
                     }
                 }
             }
@@ -180,4 +220,6 @@ def handler(event):
 
 if __name__ == "__main__":
     print("[GraniteDocling] Starting RunPod serverless handler with Docling SDK...")
+    print("[GraniteDocling] Model: GRANITEDOCLING_TRANSFORMERS")
+    print("[GraniteDocling] Accelerator: CUDA with flash_attention_2")
     runpod.serverless.start({"handler": handler})
