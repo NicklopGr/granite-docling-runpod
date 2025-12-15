@@ -29,6 +29,15 @@ import traceback
 converter = None
 
 
+def check_flash_attn_available():
+    """Check if flash_attn is installed and available."""
+    try:
+        import flash_attn
+        return True
+    except ImportError:
+        return False
+
+
 def load_converter():
     """
     Load Docling DocumentConverter with VlmPipeline for Granite-Docling.
@@ -48,16 +57,20 @@ def load_converter():
         print("[GraniteDocling] Using GRANITEDOCLING_TRANSFORMERS model spec")
         start_time = time.time()
 
+        # Check if flash_attn is available
+        use_flash_attn = check_flash_attn_available()
+        print(f"[GraniteDocling] Flash Attention 2: {'enabled' if use_flash_attn else 'disabled (not installed)'}")
+
         # Configure VLM pipeline with explicit model and GPU acceleration
         pipeline_options = VlmPipelineOptions(
             # Explicitly use Granite-Docling with Transformers framework
             vlm_options=vlm_model_specs.GRANITEDOCLING_TRANSFORMERS,
             # Generate page images for better table extraction
             generate_page_images=True,
-            # Configure GPU acceleration
+            # Configure GPU acceleration (only enable flash_attn if available)
             accelerator_options=AcceleratorOptions(
                 device=AcceleratorDevice.CUDA,
-                cuda_use_flash_attention2=True,
+                cuda_use_flash_attention2=use_flash_attn,
             ),
         )
 

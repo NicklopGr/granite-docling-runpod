@@ -22,6 +22,10 @@ RUN apt-get update && apt-get install -y \
 # Upgrade pip
 RUN pip install --upgrade pip
 
+# Install flash-attn for CUDA acceleration (requires ninja for build)
+RUN pip install ninja packaging
+RUN pip install flash-attn --no-build-isolation || echo "flash-attn installation failed, will use standard attention"
+
 # Install Docling with VLM support (IBM production approach)
 RUN pip install "docling[vlm]"
 
