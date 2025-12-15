@@ -27,13 +27,15 @@ RUN pip install ninja packaging
 RUN pip install flash-attn --no-build-isolation || echo "flash-attn installation failed, will use standard attention"
 
 # Install Docling with VLM support (IBM production approach)
-RUN pip install "docling[vlm]"
+# Use latest version 2.64.1 (Dec 2025) with all bug fixes
+RUN pip install "docling[vlm]==2.64.1"
 
 # Install additional dependencies
 RUN pip install \
     pillow \
     runpod \
-    accelerate
+    accelerate \
+    pypdf
 
 # Pre-download the Granite-Docling model during build (reduces cold start time)
 RUN python -c "\

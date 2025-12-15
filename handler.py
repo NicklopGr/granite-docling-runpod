@@ -24,6 +24,14 @@ import os
 import time
 import tempfile
 import traceback
+import io
+try:
+    from PyPDF2 import PdfReader
+except ImportError:
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        PdfReader = None  # Will handle gracefully if PDF reading fails
 
 # Global converter - loaded once, reused across requests
 converter = None
@@ -149,18 +157,47 @@ def handler(event):
             tmp_path = tmp_file.name
 
         try:
+            # Get input PDF page count for verification
+            input_page_count = 0
+            if PdfReader:
+                try:
+                    pdf_reader = PdfReader(io.BytesIO(pdf_bytes))
+                    input_page_count = len(pdf_reader.pages)
+                    print(f"[GraniteDocling] Input PDF: {input_page_count} pages")
+                except Exception as e:
+                    print(f"[GraniteDocling] Warning: Could not read input PDF page count: {e}")
+            else:
+                print("[GraniteDocling] Warning: PyPDF2/pypdf not available, cannot verify page count")
+
             # Load converter
             doc_converter = load_converter()
 
-            # Convert document
+            # Convert document with explicit parameters
             print("[GraniteDocling] Converting document with VlmPipeline...")
+            print("[GraniteDocling] Parameters: max_num_pages=None (unlimited), max_file_size=None")
             inference_start = time.time()
 
-            result = doc_converter.convert(source=tmp_path)
+            result = doc_converter.convert(
+                source=tmp_path,
+                max_num_pages=None,  # Process ALL pages explicitly
+                max_file_size=None    # No file size limit
+            )
             doc = result.document
 
             inference_time = time.time() - inference_start
             print(f"[GraniteDocling] Conversion completed in {inference_time:.2f}s")
+
+            # Verify output page count
+            output_page_count = len(doc.pages) if hasattr(doc, 'pages') else 0
+            print(f"[GraniteDocling] Output: {output_page_count} pages processed")
+
+            if input_page_count > 0 and output_page_count != input_page_count:
+                print(f"[GraniteDocling] ⚠️ WARNING: Page count mismatch!")
+                print(f"[GraniteDocling]   Input PDF: {input_page_count} pages")
+                print(f"[GraniteDocling]   Output Doc: {output_page_count} pages")
+                print(f"[GraniteDocling]   Missing: {input_page_count - output_page_count} pages")
+            elif output_page_count > 0:
+                print(f"[GraniteDocling] ✓ All {output_page_count} pages processed successfully")
 
             # Export to markdown
             markdown = doc.export_to_markdown()
@@ -196,23 +233,33 @@ def handler(event):
 
             total_time = time.time() - start_time
 
+            # Build metadata with page verification
+            metadata = {
+                "model": "granite-docling-258M",
+                "pipeline": "VlmPipeline",
+                "framework": "transformers",
+                "accelerator": "cuda",
+                "inference_time_seconds": round(inference_time, 2),
+                "total_time_seconds": round(total_time, 2),
+                "table_count": len(tables),
+                "text_items": len(text_content),
+                "page_count": page_count,
+                "input_page_count": input_page_count,
+                "output_page_count": output_page_count,
+            }
+
+            # Add warning if page count mismatch
+            if input_page_count > 0 and output_page_count != input_page_count:
+                metadata["warning"] = f"Page count mismatch: input={input_page_count}, output={output_page_count}"
+                metadata["missing_pages"] = input_page_count - output_page_count
+
             return {
                 "status": "success",
                 "result": {
                     "markdown": markdown,
                     "tables": tables,
                     "text_content": text_content,
-                    "metadata": {
-                        "model": "granite-docling-258M",
-                        "pipeline": "VlmPipeline",
-                        "framework": "transformers",
-                        "accelerator": "cuda",
-                        "inference_time_seconds": round(inference_time, 2),
-                        "total_time_seconds": round(total_time, 2),
-                        "table_count": len(tables),
-                        "text_items": len(text_content),
-                        "page_count": page_count
-                    }
+                    "metadata": metadata
                 }
             }
 
