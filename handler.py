@@ -17,7 +17,7 @@ Reference:
 - https://docling-project.github.io/docling/examples/minimal_vlm_pipeline/
 - https://docling-project.github.io/docling/examples/gpu_vlm_pipeline/
 
-Build: 2025-12-15-v7 (External vLLM with enable_remote_services)
+Build: 2025-12-15-v8 (Fixed vLLM health check endpoint)
 """
 
 import runpod

@@ -11,16 +11,20 @@ vllm serve ibm-granite/granite-docling-258M \
 VLLM_PID=$!
 echo "[Services] vLLM server started with PID $VLLM_PID"
 
-# Wait for vLLM to be ready (check health endpoint)
+# Wait for vLLM to be ready (check models endpoint)
 echo "[Services] Waiting for vLLM to be ready..."
 for i in {1..60}; do
-    if curl -s http://localhost:8001/health > /dev/null 2>&1; then
+    if curl -s http://localhost:8001/v1/models > /dev/null 2>&1; then
         echo "[Services] vLLM server is ready!"
         break
     fi
     echo "[Services] Waiting for vLLM... ($i/60)"
     sleep 5
 done
+
+# Verify vLLM is responding
+echo "[Services] Verifying vLLM server..."
+curl -s http://localhost:8001/v1/models || echo "[Services] WARNING: vLLM health check failed"
 
 # Start RunPod handler
 echo "[Services] Starting RunPod handler..."
