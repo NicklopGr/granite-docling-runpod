@@ -1,1 +1,1 @@
-2025-12-15-v4-vllm-untied-revision
+2025-12-15-v5-vllm-package-installed

@@ -17,7 +17,7 @@ Reference:
 - https://docling-project.github.io/docling/examples/minimal_vlm_pipeline/
 - https://docling-project.github.io/docling/examples/gpu_vlm_pipeline/
 
-Build: 2025-12-15-v4 (VLLM variant with untied revision for stability)
+Build: 2025-12-15-v5 (VLLM variant with vllm package installed)
 """
 
 import runpod

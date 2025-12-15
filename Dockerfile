@@ -39,6 +39,9 @@ RUN pip install --upgrade pip setuptools wheel && \
 # Use latest version 2.64.1 (Dec 2025) with all bug fixes
 RUN pip install "docling[vlm]==2.64.1"
 
+# Install vLLM for high-throughput GPU inference (required for GRANITEDOCLING_VLLM)
+RUN pip install vllm
+
 # Install additional dependencies
 RUN pip install \
     pillow \
