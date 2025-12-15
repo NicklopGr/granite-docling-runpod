@@ -25,9 +25,9 @@ RUN apt-get update && apt-get install -y \
 # Upgrade pip and build tools
 RUN pip install --upgrade pip setuptools wheel
 
-# Cache-busting argument to force rebuild of flash-attn layer
-ARG CACHEBUST=1
-RUN echo "Cache bust: $CACHEBUST - Timestamp: $(date -u +%Y%m%d-%H%M%S)"
+# Cache-busting: copy version file to force rebuild when it changes
+COPY buildversion.txt /tmp/buildversion.txt
+RUN cat /tmp/buildversion.txt && echo "Starting build at $(date -u +%Y%m%d-%H%M%S)"
 
 # Install flash-attn for CUDA acceleration (requires ninja for build)
 # Use MAX_JOBS to speed up compilation
