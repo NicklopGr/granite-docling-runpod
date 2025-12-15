@@ -16,6 +16,8 @@ Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
 - https://docling-project.github.io/docling/examples/minimal_vlm_pipeline/
 - https://docling-project.github.io/docling/examples/gpu_vlm_pipeline/
+
+Build: 2025-12-15-v2 (force rebuild for flash-attn CUDA support)
 """
 
 import runpod
