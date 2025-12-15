@@ -1,1 +1,1 @@
-2025-12-15-v6-external-vllm-api-server
+2025-12-15-v7-enable-remote-services

@@ -17,7 +17,7 @@ Reference:
 - https://docling-project.github.io/docling/examples/minimal_vlm_pipeline/
 - https://docling-project.github.io/docling/examples/gpu_vlm_pipeline/
 
-Build: 2025-12-15-v6 (External vLLM server via API)
+Build: 2025-12-15-v7 (External vLLM with enable_remote_services)
 """
 
 import runpod
@@ -78,6 +78,8 @@ def load_converter():
             vlm_options=vlm_options,
             # Generate page images for better table extraction
             generate_page_images=True,
+            # Enable remote services for external vLLM API
+            enable_remote_services=True,
         )
 
         # Create converter with VlmPipeline
