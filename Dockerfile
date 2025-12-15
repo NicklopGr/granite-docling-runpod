@@ -22,17 +22,18 @@ RUN apt-get update && apt-get install -y \
     poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip and build tools
-RUN pip install --upgrade pip setuptools wheel
-
-# Cache-busting: copy version file to force rebuild when it changes
-COPY buildversion.txt /tmp/buildversion.txt
-RUN cat /tmp/buildversion.txt && echo "Starting build at $(date -u +%Y%m%d-%H%M%S)"
-
-# Install flash-attn for CUDA acceleration (requires ninja for build)
-# Use MAX_JOBS to speed up compilation
-RUN pip install ninja packaging && \
-    MAX_JOBS=4 pip install flash-attn --no-build-isolation
+# Upgrade pip and build tools, then install flash-attn in same layer
+# This ensures CUDA_HOME environment is available during compilation
+RUN pip install --upgrade pip setuptools wheel && \
+    echo "=== Environment Check ===" && \
+    echo "CUDA_HOME: $CUDA_HOME" && \
+    echo "PATH: $PATH" && \
+    nvcc --version && \
+    echo "=== Installing flash-attn ===" && \
+    pip install ninja packaging && \
+    MAX_JOBS=4 pip install flash-attn --no-build-isolation -v && \
+    echo "=== Verifying flash-attn installation ===" && \
+    python -c "import flash_attn; print(f'flash-attn version: {flash_attn.__version__}')" || echo "flash-attn import failed"
 
 # Install Docling with VLM support (IBM production approach)
 # Use latest version 2.64.1 (Dec 2025) with all bug fixes
