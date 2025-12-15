@@ -1,1 +1,1 @@
-2025-12-15-v8-fix-vllm-health-check
+2025-12-15-v9-comprehensive-logging

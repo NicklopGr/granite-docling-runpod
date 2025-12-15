@@ -17,7 +17,7 @@ Reference:
 - https://docling-project.github.io/docling/examples/minimal_vlm_pipeline/
 - https://docling-project.github.io/docling/examples/gpu_vlm_pipeline/
 
-Build: 2025-12-15-v8 (Fixed vLLM health check endpoint)
+Build: 2025-12-15-v9 (Comprehensive logging and validation)
 """
 
 import runpod
@@ -26,6 +26,12 @@ import os
 import time
 import tempfile
 import traceback
+import json
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 # Global converter - loaded once, reused across requests
 converter = None
@@ -38,6 +44,82 @@ def check_flash_attn_available():
         return True
     except ImportError:
         return False
+
+
+def check_vllm_health():
+    """Verify vLLM server is ready and can process requests."""
+    import requests
+    try:
+        # Check models endpoint
+        response = requests.get("http://localhost:8001/v1/models", timeout=5)
+        if response.status_code != 200:
+            logger.error(f"vLLM models endpoint returned {response.status_code}")
+            return False
+
+        models = response.json()
+        logger.info(f"vLLM models available: {models}")
+
+        # Test with simple completion request
+        test_response = requests.post(
+            "http://localhost:8001/v1/chat/completions",
+            json={
+                "model": "ibm-granite/granite-docling-258M",
+                "messages": [{"role": "user", "content": "test"}],
+                "max_tokens": 10
+            },
+            timeout=30
+        )
+
+        if test_response.status_code != 200:
+            logger.error(f"vLLM test request failed: {test_response.status_code} - {test_response.text}")
+            return False
+
+        logger.info("vLLM health check PASSED")
+        return True
+
+    except Exception as e:
+        logger.error(f"vLLM health check failed: {e}")
+        return False
+
+
+def setup_api_logging():
+    """Monkey-patch requests to log all vLLM API calls."""
+    import requests
+    original_post = requests.post
+
+    def logged_post(url, *args, **kwargs):
+        if "localhost:8001" in url:
+            logger.info(f"=== vLLM API Request ===")
+            logger.info(f"URL: {url}")
+
+            # Log request body (truncate images)
+            if 'json' in kwargs:
+                req_data = kwargs['json'].copy()
+                if 'messages' in req_data:
+                    for msg in req_data['messages']:
+                        if 'content' in msg and isinstance(msg['content'], list):
+                            for item in msg['content']:
+                                if item.get('type') == 'image_url':
+                                    url_str = item['image_url']['url']
+                                    if url_str.startswith('data:'):
+                                        item['image_url']['url'] = f"data:image/png;base64,...({len(url_str)} chars)"
+                logger.info(f"Request: {json.dumps(req_data, indent=2)}")
+
+        response = original_post(url, *args, **kwargs)
+
+        if "localhost:8001" in url:
+            logger.info(f"=== vLLM API Response ===")
+            logger.info(f"Status: {response.status_code}")
+            try:
+                resp_json = response.json()
+                logger.info(f"Response: {json.dumps(resp_json, indent=2)[:2000]}")  # First 2000 chars
+            except:
+                logger.info(f"Response (raw): {response.text[:500]}")
+
+        return response
+
+    requests.post = logged_post
+    logger.info("API logging enabled")
 
 
 def load_converter():
@@ -54,8 +136,16 @@ def load_converter():
         from docling.document_converter import DocumentConverter, PdfFormatOption
         from docling.pipeline.vlm_pipeline import VlmPipeline
 
-        print("[GraniteDocling] Loading Docling with VlmPipeline...")
-        print("[GraniteDocling] Using external vLLM server (http://localhost:8001)")
+        logger.info("[GraniteDocling] Loading Docling with VlmPipeline...")
+        logger.info("[GraniteDocling] Using external vLLM server (http://localhost:8001)")
+
+        # Health check BEFORE loading converter
+        if not check_vllm_health():
+            raise RuntimeError("vLLM server health check failed - cannot initialize converter")
+
+        # Enable API logging
+        setup_api_logging()
+
         start_time = time.time()
 
         # Configure VLM pipeline with external vLLM API
@@ -64,11 +154,11 @@ def load_converter():
             params=dict(
                 model="ibm-granite/granite-docling-258M",
                 max_tokens=8192,
-                skip_special_tokens=False,  # Required for VLLM
+                skip_special_tokens=False,  # CRITICAL for DOCTAGS parsing
             ),
             headers={},
             prompt="Convert this page to docling.",
-            timeout=300,  # 5 minutes
+            timeout=600,  # Increased to 10 minutes
             scale=2.0,
             temperature=0.0,
             response_format=ResponseFormat.DOCTAGS,
@@ -93,7 +183,7 @@ def load_converter():
         )
 
         elapsed = time.time() - start_time
-        print(f"[GraniteDocling] Converter loaded in {elapsed:.2f}s")
+        logger.info(f"[GraniteDocling] Converter loaded in {elapsed:.2f}s")
 
     return converter
 
@@ -171,19 +261,39 @@ def handler(event):
 
             inference_time = time.time() - inference_start
 
-            # Log output page count
-            page_count = len(doc.pages) if hasattr(doc, 'pages') else 0
-            print(f"[GraniteDocling] Conversion completed in {inference_time:.2f}s")
-            print(f"[GraniteDocling] Processed {page_count} pages")
+            # VALIDATION: Check if page images were generated
+            if hasattr(doc, 'pages') and doc.pages:
+                page_count = len(doc.pages)
+                logger.info(f"[GraniteDocling] Generated {page_count} page objects")
+                for i, page in enumerate(doc.pages[:3]):  # Log first 3 pages
+                    if hasattr(page, 'image'):
+                        img = page.image
+                        if img is not None:
+                            logger.info(f"[GraniteDocling] Page {i}: Image size {img.size if hasattr(img, 'size') else 'unknown'}")
+                        else:
+                            logger.warning(f"[GraniteDocling] Page {i}: Image is None!")
+                    else:
+                        logger.warning(f"[GraniteDocling] Page {i}: No image attribute")
+            else:
+                page_count = 0
+                logger.error("[GraniteDocling] No pages in document!")
+
+            logger.info(f"[GraniteDocling] Conversion completed in {inference_time:.2f}s")
+            logger.info(f"[GraniteDocling] Processed {page_count} pages")
 
             # Export to markdown
             markdown = doc.export_to_markdown()
-            print(f"[GraniteDocling] Markdown length: {len(markdown)} chars")
+            logger.info(f"[GraniteDocling] Markdown length: {len(markdown)} chars")
 
             # Extract tables from document structure (more accurate than parsing markdown)
+            logger.info("[GraniteDocling] Inspecting document structure...")
+            logger.info(f"[GraniteDocling] Document attributes: {dir(doc)}")
+
             tables = []
             if hasattr(doc, 'tables') and doc.tables:
+                logger.info(f"[GraniteDocling] Found {len(doc.tables)} table objects")
                 for i, table in enumerate(doc.tables):
+                    logger.info(f"[GraniteDocling] Table {i}: {type(table)} - {dir(table)}")
                     table_md = table.export_to_markdown() if hasattr(table, 'export_to_markdown') else str(table)
                     tables.append({
                         "table_number": i + 1,
@@ -191,10 +301,21 @@ def handler(event):
                         "row_count": table_md.count('\n') if table_md else 0
                     })
             else:
+                logger.warning("[GraniteDocling] No tables found in document structure")
                 # Fallback to extracting from markdown
                 tables = extract_tables_from_markdown(markdown)
 
-            print(f"[GraniteDocling] Found {len(tables)} tables")
+            # Validate markdown content
+            if not markdown or len(markdown.strip()) == 0:
+                logger.error("[GraniteDocling] CRITICAL: Markdown is empty!")
+                logger.error(f"[GraniteDocling] Document type: {type(doc)}")
+                logger.error(f"[GraniteDocling] Document dir: {dir(doc)}")
+                if hasattr(doc, 'texts'):
+                    logger.error(f"[GraniteDocling] doc.texts length: {len(doc.texts) if doc.texts else 0}")
+            else:
+                logger.info(f"[GraniteDocling] Markdown length: {len(markdown)} chars (first 500): {markdown[:500]}")
+
+            logger.info(f"[GraniteDocling] Found {len(tables)} tables")
 
             # Extract text content with proper labels
             text_content = []
