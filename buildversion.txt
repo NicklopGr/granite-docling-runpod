@@ -1,1 +1,1 @@
-2025-12-15-v5-vllm-package-installed
+2025-12-15-v6-external-vllm-api-server

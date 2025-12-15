@@ -54,12 +54,14 @@ from huggingface_hub import snapshot_download; \
 snapshot_download('ibm-granite/granite-docling-258M'); \
 print('Granite-Docling-258M downloaded successfully')"
 
-# Copy handler
+# Copy handler and startup script
 WORKDIR /app
 COPY handler.py /app/handler.py
+COPY start-services.sh /app/start-services.sh
+RUN chmod +x /app/start-services.sh
 
-# Health check endpoint (optional)
-EXPOSE 8000
+# Expose ports (8000 for RunPod, 8001 for vLLM)
+EXPOSE 8000 8001
 
-# Run the handler
-CMD ["python", "/app/handler.py"]
+# Run startup script (starts vLLM + handler)
+CMD ["/app/start-services.sh"]

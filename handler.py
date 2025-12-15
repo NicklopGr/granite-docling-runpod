@@ -17,7 +17,7 @@ Reference:
 - https://docling-project.github.io/docling/examples/minimal_vlm_pipeline/
 - https://docling-project.github.io/docling/examples/gpu_vlm_pipeline/
 
-Build: 2025-12-15-v5 (VLLM variant with vllm package installed)
+Build: 2025-12-15-v6 (External vLLM server via API)
 """
 
 import runpod
@@ -43,37 +43,41 @@ def check_flash_attn_available():
 def load_converter():
     """
     Load Docling DocumentConverter with VlmPipeline for Granite-Docling.
-    Uses explicit model specification and GPU acceleration.
+    Uses external vLLM server via API for optimal performance.
     """
     global converter
 
     if converter is None:
-        from docling.datamodel import vlm_model_specs
+        from docling.datamodel.pipeline_options_vlm_model import ApiVlmOptions, ResponseFormat
         from docling.datamodel.base_models import InputFormat
         from docling.datamodel.pipeline_options import VlmPipelineOptions
-        from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
         from docling.document_converter import DocumentConverter, PdfFormatOption
         from docling.pipeline.vlm_pipeline import VlmPipeline
 
         print("[GraniteDocling] Loading Docling with VlmPipeline...")
-        print("[GraniteDocling] Using GRANITEDOCLING_VLLM model spec (revision='untied')")
+        print("[GraniteDocling] Using external vLLM server (http://localhost:8001)")
         start_time = time.time()
 
-        # Check if flash_attn is available
-        use_flash_attn = check_flash_attn_available()
-        print(f"[GraniteDocling] Flash Attention 2: {'enabled' if use_flash_attn else 'disabled (not installed)'}")
+        # Configure VLM pipeline with external vLLM API
+        vlm_options = ApiVlmOptions(
+            url="http://localhost:8001/v1/chat/completions",
+            params=dict(
+                model="ibm-granite/granite-docling-258M",
+                max_tokens=8192,
+                skip_special_tokens=False,  # Required for VLLM
+            ),
+            headers={},
+            prompt="Convert this page to docling.",
+            timeout=300,  # 5 minutes
+            scale=2.0,
+            temperature=0.0,
+            response_format=ResponseFormat.DOCTAGS,
+        )
 
-        # Configure VLM pipeline with explicit model and GPU acceleration
         pipeline_options = VlmPipelineOptions(
-            # Use VLLM variant with "untied" revision (fixes stability issues, 50-100x faster)
-            vlm_options=vlm_model_specs.GRANITEDOCLING_VLLM,
+            vlm_options=vlm_options,
             # Generate page images for better table extraction
             generate_page_images=True,
-            # Configure GPU acceleration (only enable flash_attn if available)
-            accelerator_options=AcceleratorOptions(
-                device=AcceleratorDevice.CUDA,
-                cuda_use_flash_attention2=use_flash_attn,
-            ),
         )
 
         # Create converter with VlmPipeline
@@ -238,6 +242,6 @@ def handler(event):
 
 if __name__ == "__main__":
     print("[GraniteDocling] Starting RunPod serverless handler with Docling SDK...")
-    print("[GraniteDocling] Model: GRANITEDOCLING_VLLM (revision='untied')")
-    print("[GraniteDocling] Accelerator: CUDA with flash_attention_2")
+    print("[GraniteDocling] Model: External vLLM server (localhost:8001)")
+    print("[GraniteDocling] Revision: untied, dtype: float32")
     runpod.serverless.start({"handler": handler})
