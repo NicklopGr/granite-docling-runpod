@@ -17,7 +17,7 @@ Reference:
 - https://docling-project.github.io/docling/examples/minimal_vlm_pipeline/
 - https://docling-project.github.io/docling/examples/gpu_vlm_pipeline/
 
-Build: 2025-12-15-v12 (Fix RGBA to RGB conversion for vLLM)
+Build: 2025-12-15-v13 (Fix logging bug that corrupted requests)
 """
 
 import runpod
@@ -159,12 +159,21 @@ def setup_api_logging():
                                         else:
                                             logger.error(f"[Base64 Validation] Data URI format invalid: {url_str[:100]}")
 
-                                        # Update original request with fixed image
-                                        kwargs['json'] = req_data
+                # Create logging copy BEFORE modifying for logs
+                log_data = kwargs['json'].copy() if 'json' in kwargs else {}
+                if 'messages' in log_data:
+                    for msg in log_data['messages']:
+                        if 'content' in msg and isinstance(msg['content'], list):
+                            for item in msg['content']:
+                                if item.get('type') == 'image_url' and 'image_url' in item:
+                                    url_str = item['image_url'].get('url', '')
+                                    if url_str.startswith('data:'):
+                                        parts = url_str.split(',', 1)
+                                        if len(parts) == 2:
+                                            b64_len = len(parts[1])
+                                            item['image_url']['url'] = f"data:image/png;base64,...({b64_len} chars)"
 
-                                        # Log truncated version
-                                        item['image_url']['url'] = f"data:image/png;base64,...({len(b64_data)} chars)"
-                logger.info(f"Request: {json.dumps(req_data, indent=2)}")
+                logger.info(f"Request: {json.dumps(log_data, indent=2)}")
 
         response = original_post(url, *args, **kwargs)
 
