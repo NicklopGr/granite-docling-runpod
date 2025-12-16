@@ -17,7 +17,7 @@ Reference:
 - https://docling-project.github.io/docling/examples/minimal_vlm_pipeline/
 - https://docling-project.github.io/docling/examples/gpu_vlm_pipeline/
 
-Build: 2025-12-15-v15 (Fix pages slicing error)
+Build: 2025-12-15-v16 (Proper dict iteration for doc.pages)
 """
 
 import runpod
@@ -330,20 +330,21 @@ def handler(event):
             inference_time = time.time() - inference_start
 
             # VALIDATION: Check if page images were generated
+            # Note: doc.pages is a dict (not list) mapping page_no -> PageItem
             if hasattr(doc, 'pages') and doc.pages:
                 page_count = len(doc.pages)
                 logger.info(f"[GraniteDocling] Generated {page_count} page objects")
-                # Convert to list if needed (doc.pages might be a special Docling object)
-                pages_list = list(doc.pages) if hasattr(doc.pages, '__iter__') else []
-                for i, page in enumerate(pages_list[:3]):  # Log first 3 pages
+                # Get first 3 page objects from the dict (doc.pages.items() returns (page_no, PageItem) tuples)
+                for i, (page_no, page) in enumerate(list(doc.pages.items())[:3]):
+                    logger.info(f"[GraniteDocling] Page {page_no}: Checking image...")
                     if hasattr(page, 'image'):
                         img = page.image
                         if img is not None:
-                            logger.info(f"[GraniteDocling] Page {i}: Image size {img.size if hasattr(img, 'size') else 'unknown'}")
+                            logger.info(f"[GraniteDocling] Page {page_no}: Image size {img.size if hasattr(img, 'size') else 'unknown'}")
                         else:
-                            logger.warning(f"[GraniteDocling] Page {i}: Image is None!")
+                            logger.warning(f"[GraniteDocling] Page {page_no}: Image is None!")
                     else:
-                        logger.warning(f"[GraniteDocling] Page {i}: No image attribute")
+                        logger.warning(f"[GraniteDocling] Page {page_no}: No image attribute")
             else:
                 page_count = 0
                 logger.error("[GraniteDocling] No pages in document!")
