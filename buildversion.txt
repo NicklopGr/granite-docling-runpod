@@ -1,1 +1,1 @@
-2025-12-16-v21-optimize-image-quality-150dpi
+2025-12-16-v21-fix-max-tokens-150dpi
