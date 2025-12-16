@@ -1,1 +1,1 @@
-2025-12-16-v22-direct-vllm-inference
+2025-12-16-v23-vllm-limit-mm-per-prompt

@@ -57,6 +57,7 @@ def load_vllm():
         llm = LLM(
             model="ibm-granite/granite-docling-258M",
             revision="untied",  # CRITICAL - untied weights required
+            limit_mm_per_prompt={"image": 1},  # CRITICAL - required for multimodal models
             gpu_memory_utilization=0.9,
             max_model_len=8192,
             trust_remote_code=True,
@@ -257,25 +258,25 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
     prompts = []
 
     for i, image in enumerate(rgb_images):
-        # Use processor to create proper prompt format
-        conversation = [
+        # Use IBM's exact format: {"type": "image"} without image data in content
+        messages = [
             {
                 "role": "user",
                 "content": [
+                    {"type": "image"},  # Just type marker, image passed in multi_modal_data
                     {"type": "text", "text": "Convert this page to docling."},
-                    {"type": "image", "image": image}
-                ]
-            }
+                ],
+            },
         ]
 
         prompt = proc.apply_chat_template(
-            conversation,
+            messages,
             add_generation_prompt=True
         )
 
         prompts.append({
             "prompt": prompt,
-            "multi_modal_data": {"image": image}
+            "multi_modal_data": {"image": image}  # Image passed here per vLLM spec
         })
 
     logger.info(f"[GraniteDocling] Prepared {len(prompts)} prompts")
@@ -283,7 +284,7 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
     # Configure sampling
     sampling_params = SamplingParams(
         temperature=0.0,  # Deterministic
-        max_tokens=6144,  # Leave room for input
+        max_tokens=8192,  # IBM's recommended value for full DOCTAGS output
         skip_special_tokens=False  # Preserve DOCTAGS
     )
 
