@@ -1,1 +1,1 @@
-2025-12-16-v17-debug-max-tokens
+2025-12-16-v18-increase-max-tokens-6144

@@ -228,7 +228,7 @@ def load_converter():
             url="http://localhost:8001/v1/chat/completions",
             params=dict(
                 model="ibm-granite/granite-docling-258M",
-                max_tokens=4096,  # Leave room for input (model max context: 8192 total)
+                max_tokens=6144,  # Increased from 4096 - model context is 8192, images use ~1000-2000 tokens
                 skip_special_tokens=False,  # CRITICAL for DOCTAGS parsing
             ),
             headers={},
