@@ -17,7 +17,7 @@ Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
 - IBM recommendation: Direct vLLM for production (not Docling SDK)
 
-Build: 2025-12-16-v22-direct-vllm-inference
+Build: 2025-12-16-v24-debug-output
 """
 
 import runpod
@@ -304,6 +304,10 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
     for i, output in enumerate(outputs):
         doctags = output.outputs[0].text
         logger.info(f"[GraniteDocling] Page {i+1} output length: {len(doctags)} chars")
+        # DEBUG: Log first 500 chars of raw output to see actual format
+        logger.info(f"[GraniteDocling] Page {i+1} raw output (first 500 chars): {doctags[:500]}")
+        # DEBUG: Log last 200 chars to check if output is truncated
+        logger.info(f"[GraniteDocling] Page {i+1} raw output (last 200 chars): {doctags[-200:]}")
 
         parsed = parse_doctags(doctags)
         results.append(parsed)
