@@ -17,7 +17,7 @@ Reference:
 - https://docling-project.github.io/docling/examples/minimal_vlm_pipeline/
 - https://docling-project.github.io/docling/examples/gpu_vlm_pipeline/
 
-Build: 2025-12-15-v14 (Fix shallow copy corruption in logging)
+Build: 2025-12-15-v15 (Fix pages slicing error)
 """
 
 import runpod
@@ -333,7 +333,9 @@ def handler(event):
             if hasattr(doc, 'pages') and doc.pages:
                 page_count = len(doc.pages)
                 logger.info(f"[GraniteDocling] Generated {page_count} page objects")
-                for i, page in enumerate(doc.pages[:3]):  # Log first 3 pages
+                # Convert to list if needed (doc.pages might be a special Docling object)
+                pages_list = list(doc.pages) if hasattr(doc.pages, '__iter__') else []
+                for i, page in enumerate(pages_list[:3]):  # Log first 3 pages
                     if hasattr(page, 'image'):
                         img = page.image
                         if img is not None:
