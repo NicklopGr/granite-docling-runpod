@@ -207,7 +207,7 @@ def load_converter():
     if converter is None:
         from docling.datamodel.pipeline_options_vlm_model import ApiVlmOptions, ResponseFormat
         from docling.datamodel.base_models import InputFormat
-        from docling.datamodel.pipeline_options import VlmPipelineOptions
+        from docling.datamodel.pipeline_options import VlmPipelineOptions, TableStructureOptions
         from docling.document_converter import DocumentConverter, PdfFormatOption
         from docling.pipeline.vlm_pipeline import VlmPipeline
 
@@ -239,8 +239,15 @@ def load_converter():
             response_format=ResponseFormat.DOCTAGS,
         )
 
+        # Configure table structure options - disable cell matching for repetitive text
+        table_structure_options = TableStructureOptions(
+            do_cell_matching=False  # CRITICAL: Prevents cell boundary confusion with repetitive text (e.g., "TURO8667352901" duplicates)
+        )
+
         pipeline_options = VlmPipelineOptions(
             vlm_options=vlm_options,
+            # Table structure configuration
+            table_structure_options=table_structure_options,
             # CRITICAL: Use backend text extraction instead of VLM-generated text (prevents hallucination)
             force_backend_text=True,
             # Generate page images for better table extraction
