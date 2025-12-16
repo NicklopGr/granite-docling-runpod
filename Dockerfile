@@ -36,16 +36,14 @@ RUN pip install --upgrade pip setuptools wheel && \
     echo "=== Verifying flash-attn installation ===" && \
     python -c "import flash_attn; print(f'flash-attn version: {flash_attn.__version__}')" || echo "flash-attn import failed"
 
-# Install Docling with VLM support (IBM production approach)
-# v21: Latest version 2.65.0 (Dec 15, 2025) - includes RapidOCR fixes, YAML output, DOCX improvements
-RUN pip install "docling[vlm]==2.65.0"
-
-# Install vLLM for high-throughput GPU inference (required for GRANITEDOCLING_VLLM)
+# Install vLLM for direct inference (IBM's recommended production approach)
 RUN pip install vllm
 
-# Install additional dependencies
+# Install dependencies for PDF rendering and processing
 RUN pip install \
+    pdf2image \
     pillow \
+    transformers \
     runpod \
     accelerate
 
