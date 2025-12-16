@@ -95,6 +95,13 @@ def setup_api_logging():
             logger.info(f"=== vLLM API Request ===")
             logger.info(f"URL: {url}")
 
+            # CRITICAL: Log max_tokens to verify it's being sent!
+            if 'json' in kwargs:
+                logger.info(f"[Request Params] model: {kwargs['json'].get('model', 'NOT SET')}")
+                logger.info(f"[Request Params] max_tokens: {kwargs['json'].get('max_tokens', 'NOT SET - WILL DEFAULT TO 16!')}")
+                logger.info(f"[Request Params] temperature: {kwargs['json'].get('temperature', 'NOT SET')}")
+                logger.info(f"[Request Params] skip_special_tokens: {kwargs['json'].get('skip_special_tokens', 'NOT SET')}")
+
             # Log request body (truncate images) and fix RGBA issue
             if 'json' in kwargs:
                 req_data = kwargs['json'].copy()
