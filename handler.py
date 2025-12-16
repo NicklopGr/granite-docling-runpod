@@ -228,13 +228,13 @@ def load_converter():
             url="http://localhost:8001/v1/chat/completions",
             params=dict(
                 model="ibm-granite/granite-docling-258M",
-                max_tokens=6144,  # Increased from 4096 - model context is 8192, images use ~1000-2000 tokens
+                max_tokens=8192,  # Full context window - v21 optimization for 150 DPI images
                 skip_special_tokens=False,  # CRITICAL for DOCTAGS parsing
             ),
             headers={},
             prompt="Convert this page to docling.",
             timeout=600,  # Increased to 10 minutes
-            scale=2.0,
+            # scale=2.0,  # REMOVED v21: Redundant with images_scale parameter below
             temperature=0.0,
             response_format=ResponseFormat.DOCTAGS,
         )
@@ -252,8 +252,9 @@ def load_converter():
             force_backend_text=True,
             # Generate page images for better table extraction
             generate_page_images=True,
-            # Image resolution scale (higher = better quality, but slower)
-            images_scale=2.0,
+            # Image resolution scale - v21: 150 DPI (2.08 × 72 DPI = 149.76 DPI ≈ 150 DPI)
+            # Matches IBM benchmark testing on FinTabNet (97% table accuracy)
+            images_scale=2.08,
             # Enable remote services for external vLLM API
             enable_remote_services=True,
         )
