@@ -17,7 +17,7 @@ Reference:
 - https://docling-project.github.io/docling/examples/minimal_vlm_pipeline/
 - https://docling-project.github.io/docling/examples/gpu_vlm_pipeline/
 
-Build: 2025-12-15-v13 (Fix logging bug that corrupted requests)
+Build: 2025-12-15-v14 (Fix shallow copy corruption in logging)
 """
 
 import runpod
@@ -159,32 +159,30 @@ def setup_api_logging():
                                         else:
                                             logger.error(f"[Base64 Validation] Data URI format invalid: {url_str[:100]}")
 
-                # Create logging copy BEFORE modifying for logs
-                log_data = kwargs['json'].copy() if 'json' in kwargs else {}
-                if 'messages' in log_data:
-                    for msg in log_data['messages']:
-                        if 'content' in msg and isinstance(msg['content'], list):
-                            for item in msg['content']:
-                                if item.get('type') == 'image_url' and 'image_url' in item:
-                                    url_str = item['image_url'].get('url', '')
-                                    if url_str.startswith('data:'):
-                                        parts = url_str.split(',', 1)
-                                        if len(parts) == 2:
-                                            b64_len = len(parts[1])
-                                            item['image_url']['url'] = f"data:image/png;base64,...({b64_len} chars)"
-
-                logger.info(f"Request: {json.dumps(log_data, indent=2)}")
-
         response = original_post(url, *args, **kwargs)
 
         if "localhost:8001" in url:
             logger.info(f"=== vLLM API Response ===")
             logger.info(f"Status: {response.status_code}")
+
+            # Log response
             try:
                 resp_json = response.json()
                 logger.info(f"Response: {json.dumps(resp_json, indent=2)[:2000]}")  # First 2000 chars
             except:
                 logger.info(f"Response (raw): {response.text[:500]}")
+
+            # Log request summary (after response, so we don't corrupt the request)
+            if 'json' in kwargs and 'messages' in kwargs['json']:
+                for msg in kwargs['json']['messages']:
+                    if isinstance(msg.get('content'), list):
+                        for item in msg['content']:
+                            if item.get('type') == 'image_url' and 'image_url' in item:
+                                url_str = item['image_url'].get('url', '')
+                                if url_str.startswith('data:'):
+                                    parts = url_str.split(',', 1)
+                                    if len(parts) == 2:
+                                        logger.info(f"Request included image: data:image/png;base64,...({len(parts[1])} chars)")
 
         return response
 
