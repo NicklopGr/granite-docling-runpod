@@ -17,7 +17,7 @@ Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
 - IBM recommendation: Direct vLLM for production (not Docling SDK)
 
-Build: 2025-12-16-v27-apply-chat-template
+Build: 2025-12-16-v28-sequential-pages
 """
 
 import runpod
@@ -231,15 +231,19 @@ def combine_pages(page_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def process_pdf(pdf_base64: str) -> Dict[str, Any]:
     """
-    Process PDF with direct vLLM inference.
+    Process PDF with direct vLLM inference using SEQUENTIAL page processing.
 
     Steps:
     1. Decode PDF bytes
     2. Render to RGB images (150 DPI, PPM format)
-    3. Prepare prompts for each page
-    4. Run batch inference via vLLM
-    5. Parse DOCTAGS output
-    6. Combine pages
+    3. Process each page SEQUENTIALLY (not batched) to avoid encoder cache exhaustion
+    4. Parse DOCTAGS output for each page
+    5. Combine pages
+
+    NOTE: Sequential processing is required because vLLM's encoder cache (8192 tokens)
+    gets exhausted when processing multiple images in a single batch, causing
+    subsequent pages to produce empty OTSL output.
+    See: https://github.com/vllm-project/vllm/issues/20123
     """
     from vllm import SamplingParams
 
@@ -254,11 +258,6 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
     # Render to RGB
     rgb_images = render_pdf_to_rgb(pdf_bytes)
 
-    # Prepare prompts for each page using IBM's official approach
-    # Reference: https://huggingface.co/ibm-granite/granite-docling-258M/raw/main/README.md
-    logger.info("[GraniteDocling] Preparing prompts for batch inference...")
-    prompts = []
-
     # IBM's official message format for granite-docling
     messages = [
         {
@@ -270,21 +269,6 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
         },
     ]
 
-    for i, image in enumerate(rgb_images):
-        # Use processor.apply_chat_template as per IBM documentation
-        prompt = proc.apply_chat_template(messages, add_generation_prompt=True)
-
-        # DEBUG: Log the prompt being used (only first page to avoid spam)
-        if i == 0:
-            logger.info(f"[GraniteDocling] Using prompt format: {prompt[:200]}...")
-
-        prompts.append({
-            "prompt": prompt,
-            "multi_modal_data": {"image": image}
-        })
-
-    logger.info(f"[GraniteDocling] Prepared {len(prompts)} prompts")
-
     # Configure sampling
     sampling_params = SamplingParams(
         temperature=0.0,  # Deterministic
@@ -292,29 +276,48 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
         skip_special_tokens=False  # Preserve DOCTAGS
     )
 
-    # Run batch inference
-    logger.info("[GraniteDocling] Running batch inference...")
+    # Process pages SEQUENTIALLY to avoid encoder cache exhaustion
+    # Each generate() call gets a fresh encoder cache
+    logger.info(f"[GraniteDocling] Processing {len(rgb_images)} pages SEQUENTIALLY...")
     inference_start = time.time()
-
-    outputs = llm_client.generate(prompts, sampling_params=sampling_params)
-
-    inference_time = time.time() - inference_start
-    logger.info(f"[GraniteDocling] Inference completed in {inference_time:.2f}s ({inference_time/len(prompts):.2f}s per page)")
-
-    # Parse DOCTAGS from outputs
-    logger.info("[GraniteDocling] Parsing DOCTAGS outputs...")
     results = []
 
-    for i, output in enumerate(outputs):
-        doctags = output.outputs[0].text
-        logger.info(f"[GraniteDocling] Page {i+1} output length: {len(doctags)} chars")
+    for i, image in enumerate(rgb_images):
+        page_start = time.time()
+
+        # Use processor.apply_chat_template as per IBM documentation
+        prompt = proc.apply_chat_template(messages, add_generation_prompt=True)
+
+        # DEBUG: Log the prompt being used (only first page to avoid spam)
+        if i == 0:
+            logger.info(f"[GraniteDocling] Using prompt format: {prompt[:200]}...")
+
+        # Create single-page prompt
+        single_prompt = [{
+            "prompt": prompt,
+            "multi_modal_data": {"image": image}
+        }]
+
+        # Process single page - fresh encoder cache for each page
+        logger.info(f"[GraniteDocling] Processing page {i+1}/{len(rgb_images)}...")
+        page_output = llm_client.generate(single_prompt, sampling_params=sampling_params)
+
+        # Extract DOCTAGS from output
+        doctags = page_output[0].outputs[0].text
+        page_time = time.time() - page_start
+
+        logger.info(f"[GraniteDocling] Page {i+1} completed in {page_time:.2f}s: {len(doctags)} chars")
         # DEBUG: Log first 500 chars of raw output to see actual format
         logger.info(f"[GraniteDocling] Page {i+1} raw output (first 500 chars): {doctags[:500]}")
         # DEBUG: Log last 200 chars to check if output is truncated
         logger.info(f"[GraniteDocling] Page {i+1} raw output (last 200 chars): {doctags[-200:]}")
 
+        # Parse DOCTAGS for this page
         parsed = parse_doctags(doctags)
         results.append(parsed)
+
+    inference_time = time.time() - inference_start
+    logger.info(f"[GraniteDocling] All pages completed in {inference_time:.2f}s ({inference_time/len(rgb_images):.2f}s per page)")
 
     # Combine pages
     combined = combine_pages(results)

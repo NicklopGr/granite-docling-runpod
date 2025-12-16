@@ -1,1 +1,1 @@
-2025-12-16-v27-apply-chat-template
+2025-12-16-v28-sequential-pages
