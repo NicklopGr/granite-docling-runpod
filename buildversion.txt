@@ -1,1 +1,1 @@
-2025-12-16-v26-explicit-image-placeholder
+2025-12-16-v27-apply-chat-template

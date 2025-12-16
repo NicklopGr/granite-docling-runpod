@@ -17,7 +17,7 @@ Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
 - IBM recommendation: Direct vLLM for production (not Docling SDK)
 
-Build: 2025-12-16-v26-explicit-image-placeholder
+Build: 2025-12-16-v27-apply-chat-template
 """
 
 import runpod
@@ -254,18 +254,29 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
     # Render to RGB
     rgb_images = render_pdf_to_rgb(pdf_bytes)
 
-    # Prepare prompts for each page
+    # Prepare prompts for each page using IBM's official approach
+    # Reference: https://huggingface.co/ibm-granite/granite-docling-258M/raw/main/README.md
     logger.info("[GraniteDocling] Preparing prompts for batch inference...")
     prompts = []
 
-    for i, image in enumerate(rgb_images):
-        # Use explicit <image> placeholder as required by vLLM for offline inference
-        # Reference: https://docs.vllm.ai/en/v0.6.4/models/vlm.html
-        prompt = "<image>Convert this page to docling."
+    # IBM's official message format for granite-docling
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": "Convert this page to docling."}
+            ],
+        },
+    ]
 
-        # DEBUG: Log the prompt being used
+    for i, image in enumerate(rgb_images):
+        # Use processor.apply_chat_template as per IBM documentation
+        prompt = proc.apply_chat_template(messages, add_generation_prompt=True)
+
+        # DEBUG: Log the prompt being used (only first page to avoid spam)
         if i == 0:
-            logger.info(f"[GraniteDocling] Using prompt format: {prompt}")
+            logger.info(f"[GraniteDocling] Using prompt format: {prompt[:200]}...")
 
         prompts.append({
             "prompt": prompt,
