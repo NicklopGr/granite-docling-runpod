@@ -17,7 +17,7 @@ Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
 - IBM recommendation: Direct vLLM for production (not Docling SDK)
 
-Build: 2025-12-16-v28-sequential-pages
+Build: 2025-12-16-v29-disable-prefix-cache
 """
 
 import runpod
@@ -55,6 +55,11 @@ def load_vllm():
 
         # Load vLLM model
         # Using bfloat16 for A4500/ADA GPUs which support it natively
+        # CRITICAL: Disable prefix caching for multimodal models!
+        # vLLM's prefix caching is based on prompt tokens only, ignoring images.
+        # With identical prompts across pages, cached KV state from Page 1 would be
+        # incorrectly reused for Pages 2-4, causing truncated/empty outputs.
+        # See: https://github.com/vllm-project/vllm/issues/20261
         llm = LLM(
             model="ibm-granite/granite-docling-258M",
             revision="untied",  # CRITICAL - untied weights required
@@ -62,7 +67,8 @@ def load_vllm():
             gpu_memory_utilization=0.9,
             max_model_len=8192,
             trust_remote_code=True,
-            dtype="bfloat16"  # A4500/ADA GPUs support bfloat16
+            dtype="bfloat16",  # A4500/ADA GPUs support bfloat16
+            enable_prefix_caching=False  # CRITICAL - disable for multimodal (default is True!)
         )
 
         # Load processor for prompt formatting
