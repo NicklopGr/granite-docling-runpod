@@ -241,8 +241,12 @@ def load_converter():
 
         pipeline_options = VlmPipelineOptions(
             vlm_options=vlm_options,
+            # CRITICAL: Use backend text extraction instead of VLM-generated text (prevents hallucination)
+            force_backend_text=True,
             # Generate page images for better table extraction
             generate_page_images=True,
+            # Image resolution scale (higher = better quality, but slower)
+            images_scale=2.0,
             # Enable remote services for external vLLM API
             enable_remote_services=True,
         )
