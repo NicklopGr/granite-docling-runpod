@@ -17,7 +17,7 @@ Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
 - IBM recommendation: Direct vLLM for production (not Docling SDK)
 
-Build: 2025-12-16-v24-debug-output
+Build: 2025-12-16-v25-dtype-float32
 """
 
 import runpod
@@ -54,6 +54,8 @@ def load_vllm():
         start_time = time.time()
 
         # Load vLLM model
+        # NOTE: dtype="float32" required for GPUs without bfloat16 support (T4, etc.)
+        # Otherwise model outputs garbage like "!!!!!!!!!!!!!!!!"
         llm = LLM(
             model="ibm-granite/granite-docling-258M",
             revision="untied",  # CRITICAL - untied weights required
@@ -61,7 +63,7 @@ def load_vllm():
             gpu_memory_utilization=0.9,
             max_model_len=8192,
             trust_remote_code=True,
-            dtype="float16"  # Use float16 for better performance
+            dtype="float32"  # CRITICAL: float32 for compatibility (not bfloat16/float16)
         )
 
         # Load processor for prompt formatting
