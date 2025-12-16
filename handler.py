@@ -17,7 +17,7 @@ Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
 - IBM recommendation: Direct vLLM for production (not Docling SDK)
 
-Build: 2025-12-16-v25-dtype-float32
+Build: 2025-12-16-v26-explicit-image-placeholder
 """
 
 import runpod
@@ -54,8 +54,7 @@ def load_vllm():
         start_time = time.time()
 
         # Load vLLM model
-        # NOTE: dtype="float32" required for GPUs without bfloat16 support (T4, etc.)
-        # Otherwise model outputs garbage like "!!!!!!!!!!!!!!!!"
+        # Using bfloat16 for A4500/ADA GPUs which support it natively
         llm = LLM(
             model="ibm-granite/granite-docling-258M",
             revision="untied",  # CRITICAL - untied weights required
@@ -63,7 +62,7 @@ def load_vllm():
             gpu_memory_utilization=0.9,
             max_model_len=8192,
             trust_remote_code=True,
-            dtype="float32"  # CRITICAL: float32 for compatibility (not bfloat16/float16)
+            dtype="bfloat16"  # A4500/ADA GPUs support bfloat16
         )
 
         # Load processor for prompt formatting
@@ -260,25 +259,17 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
     prompts = []
 
     for i, image in enumerate(rgb_images):
-        # Use IBM's exact format: {"type": "image"} without image data in content
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},  # Just type marker, image passed in multi_modal_data
-                    {"type": "text", "text": "Convert this page to docling."},
-                ],
-            },
-        ]
+        # Use explicit <image> placeholder as required by vLLM for offline inference
+        # Reference: https://docs.vllm.ai/en/v0.6.4/models/vlm.html
+        prompt = "<image>Convert this page to docling."
 
-        prompt = proc.apply_chat_template(
-            messages,
-            add_generation_prompt=True
-        )
+        # DEBUG: Log the prompt being used
+        if i == 0:
+            logger.info(f"[GraniteDocling] Using prompt format: {prompt}")
 
         prompts.append({
             "prompt": prompt,
-            "multi_modal_data": {"image": image}  # Image passed here per vLLM spec
+            "multi_modal_data": {"image": image}
         })
 
     logger.info(f"[GraniteDocling] Prepared {len(prompts)} prompts")
