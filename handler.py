@@ -17,7 +17,7 @@ Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
 - IBM recommendation: Direct vLLM for production (not Docling SDK)
 
-Build: 2025-12-17-v31-batch-processing
+Build: 2025-12-17-v32-transformers-backend
 """
 
 import runpod
@@ -62,10 +62,14 @@ def load_vllm():
         # See: https://github.com/vllm-project/vllm/issues/20261
         #
         # v31: Reduced gpu_memory_utilization from 0.9 to 0.3 (Docling default)
-        # Batch processing needs more headroom for multiple images
+        # v32: Added model_impl="transformers" - CRITICAL for multimodal VLM!
+        #      Docling's official vLLM implementation uses this parameter.
+        #      Forces HuggingFace Transformers backend which properly handles Idefics3.
+        #      See: https://github.com/docling-project/docling/blob/main/docling/models/vlm_models_inline/vllm_model.py
         llm = LLM(
             model="ibm-granite/granite-docling-258M",
             revision="untied",  # CRITICAL - untied weights required
+            model_impl="transformers",  # v32: CRITICAL - use Transformers backend for Idefics3
             limit_mm_per_prompt={"image": 1},  # CRITICAL - required for multimodal models
             gpu_memory_utilization=0.3,  # v31: Reduced from 0.9 for batch processing
             max_model_len=8192,
