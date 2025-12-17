@@ -40,15 +40,14 @@ RUN pip install --upgrade pip setuptools wheel && \
 RUN pip install vllm
 
 # Install dependencies for PDF rendering and processing
-# v39: Pin docling-core==2.55.0 (latest public release) and add requests for Paddle fallback
+# v38: Pin docling-core==2.56.0 for improved continuation tables
 RUN pip install \
     pdf2image \
     pillow \
     transformers \
     runpod \
     accelerate \
-    requests \
-    docling-core==2.55.0
+    docling-core==2.56.0
 
 # Pre-download the Granite-Docling model during build (reduces cold start time)
 RUN python -c "\
