@@ -38,6 +38,15 @@ import torch
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
+# Prompt reminding Granite about DocTags schema (mirrors IBM reference)
+DOC_TAG_PROMPT = """You are Docling, an AI that converts document images into DocTags.
+Follow this schema exactly:
+- Begin with <doctag> and end with </doctag>.
+- Use structural tags such as <section_header_level_1>, <text>, <picture>, <otsl>, <ched>, <fcel>, <ecel>.
+- For tables, emit <otsl> for the table region and then DocTags rows using <ched> (header), <fcel> (cell), <ecel>.
+- Preserve the reading order from top-left to bottom-right.
+Convert the provided page image into DocTags with accurate table markup."""
+
 # v35: Enable TensorFloat32 tensor cores for faster float32 matrix multiplication
 # This addresses the warning: "TensorFloat32 tensor cores available but not enabled"
 # TF32 uses 19-bit precision (vs 32-bit) for 8x faster matmul with minimal accuracy loss
@@ -78,9 +87,9 @@ def load_vllm():
             revision="untied",  # CRITICAL - untied weights required
             model_impl="transformers",  # CRITICAL - use Transformers backend for Idefics3
             enforce_eager=True,  # CRITICAL - disable CUDA graphs (matches Docling)
-            limit_mm_per_prompt={"image": 1},  # CRITICAL - required for multimodal models
+            limit_mm_per_prompt={"image": 4},  # Allow multiple images prompt context
             trust_remote_code=True,
-            enable_prefix_caching=False  # CRITICAL - disable for multimodal
+            enable_prefix_caching=True  # Align with docling inline VLM defaults
             # Let vLLM auto-detect: dtype, gpu_memory_utilization (0.9), max_model_len
         )
 
@@ -109,12 +118,10 @@ def render_pdf_to_rgb(pdf_bytes: bytes) -> List[Image.Image]:
     start_time = time.time()
 
     # Convert PDF to images
-    # v33: Changed from 150 DPI to 144 DPI to match Docling's scale=2.0 setting
-    # Docling uses scale=2.0 which is 72 base DPI × 2 = 144 DPI
-    # See: https://github.com/docling-project/docling/blob/main/docling/datamodel/vlm_model_specs.py
+    # Increase to 192 DPI for sharper tables (helps Granite detect gridlines)
     images = convert_from_bytes(
         pdf_bytes,
-        dpi=144,  # v33: Match Docling's scale=2.0 (72 × 2 = 144 DPI)
+        dpi=192,
         fmt='ppm'  # PPM format = RGB by default (no alpha channel)
     )
 
@@ -299,7 +306,7 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
             "role": "user",
             "content": [
                 {"type": "image"},
-                {"type": "text", "text": "Convert this page to docling."}
+                {"type": "text", "text": DOC_TAG_PROMPT}
             ],
         },
     ]
