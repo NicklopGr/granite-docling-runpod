@@ -19,7 +19,7 @@ Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
 - IBM recommendation: Direct vLLM for production (not Docling SDK)
 
-Build: 2025-12-17-v37-multipage-docling
+Build: 2025-12-17-v38-debug-tables
 """
 
 import runpod
@@ -167,17 +167,56 @@ def parse_all_doctags_with_docling_core(all_doctags: List[str], all_images: List
         text_content = []
 
         # DoclingDocument has structured access to tables
+        # v38: Added detailed debugging for table extraction failures
+        logger.info(f"[GraniteDocling] v38: Found {len(doc.tables) if hasattr(doc, 'tables') and doc.tables else 0} tables in document")
         if hasattr(doc, 'tables') and doc.tables:
             for i, table in enumerate(doc.tables):
-                # v37: Pass doc to export_to_markdown to avoid deprecation warning
-                table_md = table.export_to_markdown(doc=doc) if hasattr(table, 'export_to_markdown') else str(table)
-                row_count = len(table_md.strip().split('\n')) - 1 if table_md else 0  # Exclude header separator
-                tables.append({
-                    "table_number": i + 1,
-                    "markdown": table_md,
-                    "row_count": row_count
-                })
-                logger.info(f"[GraniteDocling] Table {i+1}: {row_count} rows")
+                try:
+                    logger.info(f"[GraniteDocling] v38: Processing table {i+1}/{len(doc.tables)}")
+                    logger.info(f"[GraniteDocling] v38: Table {i+1} type: {type(table)}")
+                    logger.info(f"[GraniteDocling] v38: Table {i+1} has export_to_markdown: {hasattr(table, 'export_to_markdown')}")
+
+                    # v38: Try different export methods
+                    table_md = ""
+                    if hasattr(table, 'export_to_markdown'):
+                        try:
+                            # Try with doc parameter first
+                            table_md = table.export_to_markdown(doc=doc)
+                            logger.info(f"[GraniteDocling] v38: Table {i+1} export_to_markdown(doc=doc) succeeded: {len(table_md)} chars")
+                        except TypeError as te:
+                            # Fallback without doc parameter if it's not supported
+                            logger.warning(f"[GraniteDocling] v38: Table {i+1} export_to_markdown(doc=doc) failed: {te}")
+                            try:
+                                table_md = table.export_to_markdown()
+                                logger.info(f"[GraniteDocling] v38: Table {i+1} export_to_markdown() succeeded: {len(table_md)} chars")
+                            except Exception as e2:
+                                logger.error(f"[GraniteDocling] v38: Table {i+1} export_to_markdown() also failed: {e2}")
+                                table_md = str(table)
+                        except Exception as e:
+                            logger.error(f"[GraniteDocling] v38: Table {i+1} export_to_markdown(doc=doc) exception: {e}")
+                            table_md = str(table)
+                    else:
+                        table_md = str(table)
+                        logger.info(f"[GraniteDocling] v38: Table {i+1} used str(): {len(table_md)} chars")
+
+                    row_count = len(table_md.strip().split('\n')) - 1 if table_md else 0
+                    tables.append({
+                        "table_number": i + 1,
+                        "markdown": table_md,
+                        "row_count": row_count
+                    })
+                    logger.info(f"[GraniteDocling] Table {i+1}: {row_count} rows")
+
+                except Exception as table_error:
+                    logger.error(f"[GraniteDocling] v38: FAILED processing table {i+1}: {table_error}")
+                    logger.error(f"[GraniteDocling] v38: Table {i+1} error traceback: {traceback.format_exc()}")
+                    # Add empty table to maintain count
+                    tables.append({
+                        "table_number": i + 1,
+                        "markdown": "",
+                        "row_count": 0,
+                        "error": str(table_error)
+                    })
 
         # Extract text content
         if hasattr(doc, 'texts') and doc.texts:
