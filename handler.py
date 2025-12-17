@@ -18,7 +18,7 @@ Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
 - IBM recommendation: Direct vLLM for production (not Docling SDK)
 
-Build: 2025-12-17-v33-docling-aligned
+Build: 2025-12-17-v34-vllm-defaults
 """
 
 import runpod
@@ -54,29 +54,21 @@ def load_vllm():
 
         start_time = time.time()
 
-        # Load vLLM model
-        # Using bfloat16 for A4500/ADA GPUs which support it natively
-        # CRITICAL: Disable prefix caching for multimodal models!
-        # vLLM's prefix caching is based on prompt tokens only, ignoring images.
-        # With identical prompts across pages, cached KV state from Page 1 would be
-        # incorrectly reused for Pages 2-4, causing truncated/empty outputs.
-        # See: https://github.com/vllm-project/vllm/issues/20261
-        #
-        # v31: Reduced gpu_memory_utilization from 0.9 to 0.3 (Docling default)
-        # v32: Added model_impl="transformers" - CRITICAL for multimodal VLM!
-        #      Docling's official vLLM implementation uses this parameter.
-        #      Forces HuggingFace Transformers backend which properly handles Idefics3.
+        # Load vLLM model with Docling-aligned settings
+        # v34: Use vLLM defaults for dtype, gpu_memory_utilization, max_model_len
+        #      Only set parameters that Docling explicitly requires:
+        #      - model_impl="transformers": Forces HuggingFace backend for Idefics3
+        #      - limit_mm_per_prompt: Required for multimodal models
+        #      - enable_prefix_caching=False: Prevents KV cache reuse across different images
         #      See: https://github.com/docling-project/docling/blob/main/docling/models/vlm_models_inline/vllm_model.py
         llm = LLM(
             model="ibm-granite/granite-docling-258M",
             revision="untied",  # CRITICAL - untied weights required
-            model_impl="transformers",  # v32: CRITICAL - use Transformers backend for Idefics3
+            model_impl="transformers",  # CRITICAL - use Transformers backend for Idefics3
             limit_mm_per_prompt={"image": 1},  # CRITICAL - required for multimodal models
-            gpu_memory_utilization=0.3,  # v31: Reduced from 0.9 for batch processing
-            max_model_len=8192,
             trust_remote_code=True,
-            dtype="bfloat16",  # A4500/ADA GPUs support bfloat16
-            enable_prefix_caching=False  # CRITICAL - disable for multimodal (default is True!)
+            enable_prefix_caching=False  # CRITICAL - disable for multimodal
+            # Let vLLM auto-detect: dtype, gpu_memory_utilization (0.9), max_model_len
         )
 
         # Load processor for prompt formatting
