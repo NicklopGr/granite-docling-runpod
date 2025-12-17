@@ -136,118 +136,97 @@ def render_pdf_to_rgb(pdf_bytes: bytes) -> List[Image.Image]:
     return rgb_images
 
 
-def parse_all_doctags_with_docling_core(all_doctags: List[str], all_images: List[Image.Image]) -> Dict[str, Any]:
+def parse_page_with_docling_core(
+    doctags_text: str,
+    image: Image.Image,
+    page_number: int
+) -> Dict[str, Any]:
     """
-    Parse ALL DocTags outputs at once using docling-core library (IBM's official approach).
-
-    v37: CRITICAL FIX - Parse entire document at once instead of page-by-page.
-    Docling's VLM pipeline expects the full document so its global table heuristics
-    can run across all pages. Page-by-page parsing was causing empty tables on pages 2+
-    because continuation tables need context from page 1's header structure.
-
-    This properly handles the location tokens (<loc_X>) and converts
-    the raw DocTags output to structured Markdown with tables extracted.
+    Parse a single page of DocTags using docling-core.
+    This mirrors the transformers.js demo (one image at a time) and avoids
+    the current limitations docling-core has with multi-page continuation tables.
     """
     from docling_core.types.doc import DoclingDocument
     from docling_core.types.doc.document import DocTagsDocument
 
-    logger.info(f"[GraniteDocling] v37: Parsing {len(all_doctags)} pages with docling-core (multi-page mode)")
+    logger.info(f"[GraniteDocling] v38: Parsing page {page_number} with docling-core")
 
     try:
-        # v37: Pass ALL pages at once to docling-core
-        # This allows cross-page table heuristics to work properly
-        doctags_doc = DocTagsDocument.from_doctags_and_image_pairs(all_doctags, all_images)
-        doc = DoclingDocument.load_from_doctags(doctags_doc, document_name="Document")
+        doctags_doc = DocTagsDocument.from_doctags_and_image_pairs([doctags_text], [image])
+        doc = DoclingDocument.load_from_doctags(
+            doctags_doc,
+            document_name=f"Page {page_number}"
+        )
 
-        # Export to markdown
         markdown = doc.export_to_markdown()
-
-        # Extract tables from the document
         tables = []
         text_content = []
 
-        # DoclingDocument has structured access to tables
-        # v38: Added detailed debugging for table extraction failures
-        logger.info(f"[GraniteDocling] v38: Found {len(doc.tables) if hasattr(doc, 'tables') and doc.tables else 0} tables in document")
         if hasattr(doc, 'tables') and doc.tables:
+            logger.info(f"[GraniteDocling] v38: Found {len(doc.tables)} tables on page {page_number}")
             for i, table in enumerate(doc.tables):
                 try:
-                    logger.info(f"[GraniteDocling] v38: Processing table {i+1}/{len(doc.tables)}")
-                    logger.info(f"[GraniteDocling] v38: Table {i+1} type: {type(table)}")
-                    logger.info(f"[GraniteDocling] v38: Table {i+1} has export_to_markdown: {hasattr(table, 'export_to_markdown')}")
+                    logger.info(f"[GraniteDocling] v38: Processing table {i + 1}/{len(doc.tables)} on page {page_number}")
 
-                    # v38: Try different export methods
                     table_md = ""
                     if hasattr(table, 'export_to_markdown'):
                         try:
-                            # Try with doc parameter first
                             table_md = table.export_to_markdown(doc=doc)
-                            logger.info(f"[GraniteDocling] v38: Table {i+1} export_to_markdown(doc=doc) succeeded: {len(table_md)} chars")
                         except TypeError as te:
-                            # Fallback without doc parameter if it's not supported
-                            logger.warning(f"[GraniteDocling] v38: Table {i+1} export_to_markdown(doc=doc) failed: {te}")
-                            try:
-                                table_md = table.export_to_markdown()
-                                logger.info(f"[GraniteDocling] v38: Table {i+1} export_to_markdown() succeeded: {len(table_md)} chars")
-                            except Exception as e2:
-                                logger.error(f"[GraniteDocling] v38: Table {i+1} export_to_markdown() also failed: {e2}")
-                                table_md = str(table)
-                        except Exception as e:
-                            logger.error(f"[GraniteDocling] v38: Table {i+1} export_to_markdown(doc=doc) exception: {e}")
-                            table_md = str(table)
+                            logger.warning(f"[GraniteDocling] v38: Table {i+1} export_to_markdown(doc=doc) failed on page {page_number}: {te}")
+                            table_md = table.export_to_markdown()
                     else:
                         table_md = str(table)
-                        logger.info(f"[GraniteDocling] v38: Table {i+1} used str(): {len(table_md)} chars")
 
                     row_count = len(table_md.strip().split('\n')) - 1 if table_md else 0
                     tables.append({
                         "table_number": i + 1,
                         "markdown": table_md,
-                        "row_count": row_count
+                        "row_count": row_count,
+                        "page_number": page_number
                     })
-                    logger.info(f"[GraniteDocling] Table {i+1}: {row_count} rows")
+                    logger.info(f"[GraniteDocling] Table {i+1} on page {page_number}: {row_count} rows")
                     if row_count == 0 or not table_md.strip():
-                        logger.warning(f"[GraniteDocling] v38: Table {i+1} markdown empty after export (possible continuation page)")
+                        logger.warning(f"[GraniteDocling] v38: Table {i+1} markdown empty on page {page_number} (likely continuation)")
 
                 except Exception as table_error:
-                    logger.exception(f"[GraniteDocling] v38: FAILED processing table {i+1}: {table_error}")
-                    # Add empty table to maintain count
+                    logger.exception(f"[GraniteDocling] v38: FAILED processing table {i+1} on page {page_number}: {table_error}")
                     tables.append({
                         "table_number": i + 1,
                         "markdown": "",
                         "row_count": 0,
+                        "page_number": page_number,
                         "error": str(table_error)
                     })
 
-        # Extract text content
         if hasattr(doc, 'texts') and doc.texts:
             for text in doc.texts:
                 text_content.append({
                     "text": str(text),
-                    "type": "text"
+                    "type": "text",
+                    "page_number": page_number
                 })
 
-        logger.info(f"[GraniteDocling] docling-core parsed: {len(tables)} tables, {len(text_content)} text items")
-        logger.info(f"[GraniteDocling] Markdown length: {len(markdown)} chars")
+        logger.info(f"[GraniteDocling] Page {page_number}: docling-core parsed {len(tables)} tables, {len(text_content)} text items")
+        logger.info(f"[GraniteDocling] Page {page_number}: Markdown length {len(markdown)} chars")
 
         return {
             "tables": tables,
             "text_content": text_content,
             "markdown": markdown,
-            "raw_doctags": all_doctags
+            "raw_doctags": doctags_text,
+            "page_number": page_number
         }
 
     except Exception as e:
-        logger.error(f"[GraniteDocling] docling-core parsing failed: {e}")
-        logger.error(f"[GraniteDocling] Error details: {traceback.format_exc()}")
-        logger.info("[GraniteDocling] Falling back to raw DocTags output")
-        # Fallback: return raw doctags as text
-        combined_doctags = "\n\n--- Page Break ---\n\n".join(all_doctags)
+        logger.exception(f"[GraniteDocling] docling-core parsing failed on page {page_number}: {e}")
         return {
             "tables": [],
-            "text_content": [{"text": combined_doctags, "type": "raw_doctags"}],
-            "markdown": combined_doctags,
-            "raw_doctags": all_doctags
+            "text_content": [{"text": doctags_text, "type": "raw_doctags", "page_number": page_number}],
+            "markdown": doctags_text,
+            "raw_doctags": doctags_text,
+            "page_number": page_number,
+            "error": str(e)
         }
 
 
@@ -345,7 +324,7 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
     prompt = proc.apply_chat_template(messages, add_generation_prompt=True)
     logger.info(f"[GraniteDocling] Using prompt format: {prompt[:200]}...")
 
-    # v37: Collect ALL doctags and images first, then parse together
+    # Collect all doctags/images first, then parse page-by-page
     all_doctags = []
     all_images_for_parsing = []
     total_pages = len(rgb_images)
@@ -390,15 +369,18 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
     inference_time = time.time() - inference_start
     logger.info(f"[GraniteDocling] vLLM inference completed in {inference_time:.2f}s ({inference_time/len(rgb_images):.2f}s per page)")
 
-    # v37: Parse ALL pages at once with docling-core
-    # This is the critical fix - docling-core needs all pages together for cross-page table heuristics
-    logger.info(f"[GraniteDocling] v37: Parsing all {len(all_doctags)} pages together with docling-core...")
+    # Parse each page independently (matches transformers.js demo behavior)
+    logger.info(f"[GraniteDocling] v38: Parsing {len(all_doctags)} pages individually with docling-core...")
     parse_start = time.time()
-    result = parse_all_doctags_with_docling_core(all_doctags, all_images_for_parsing)
-    parse_time = time.time() - parse_start
-    logger.info(f"[GraniteDocling] docling-core parsing completed in {parse_time:.2f}s")
+    page_results = []
+    for page_idx, (doctags, image) in enumerate(zip(all_doctags, all_images_for_parsing), start=1):
+        page_results.append(parse_page_with_docling_core(doctags, image, page_idx))
 
-    return result, inference_time, len(rgb_images)
+    parse_time = time.time() - parse_start
+    logger.info(f"[GraniteDocling] docling-core page-by-page parsing completed in {parse_time:.2f}s")
+
+    combined = combine_pages(page_results)
+    return combined, inference_time, len(rgb_images)
 
 
 def handler(event):
