@@ -1,10 +1,10 @@
 # Granite-Docling-258M RunPod Dependencies
-# v38: Pin docling-core to 2.56.0 (continuation table fixes)
-# This ensures consistent DocTags parsing across builds
+# v38: Pin docling-core to latest public release (2.55.0 as of Dec 2025)
+# This ensures consistent DocTags parsing across builds without referencing non-existent wheels
 
 # Core docling-core for DocTags -> Markdown conversion
 # v37: Pin version for consistency with FIN-OCR docling container
-docling-core==2.56.0
+docling-core==2.55.0
 
 # Image processing
 pillow

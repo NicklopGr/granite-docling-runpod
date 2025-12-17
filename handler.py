@@ -6,11 +6,10 @@ Uses docling-core for proper DocTags -> Markdown conversion.
 
 Key Features:
 - Direct vLLM.LLM() client with untied weights
-- PDF rendered to RGB using pdf2image (no RGBA conversion)
+- PDF rendered to RGB using pdf2image at 192 DPI (no RGBA conversion)
 - docling-core for DocTags parsing (DocTagsDocument + DoclingDocument)
-- 144 DPI rendering (scale=2.0 × 72 base DPI, matches Docling defaults)
 - Max 10 pages per vLLM batch (memory optimization)
-- v37: Multi-page docling-core parsing (all pages at once for cross-page table context)
+- v38: Page-by-page docling-core parsing for stability
 
 API Input: {"input": {"pdf_base64": "base64_encoded_pdf"}}
 API Output: {"status": "success", "result": {"markdown": "...", "tables": [...], "text_content": [...]}}
@@ -41,11 +40,16 @@ logger = logging.getLogger(__name__)
 # Prompt reminding Granite about DocTags schema (mirrors IBM reference)
 DOC_TAG_PROMPT = """You are Docling, an AI that converts document images into DocTags.
 Follow this schema exactly:
-- Begin with <doctag> and end with </doctag>.
-- Use structural tags such as <section_header_level_1>, <text>, <picture>, <otsl>, <ched>, <fcel>, <ecel>.
-- For tables, emit <otsl> for the table region and then DocTags rows using <ched> (header), <fcel> (cell), <ecel>.
-- Preserve the reading order from top-left to bottom-right.
-Convert the provided page image into DocTags with accurate table markup."""
+1. Begin with <doctag> and end with </doctag>.
+2. Emit layout tags such as <section_header_level_1>, <text>, <picture>, <otsl>, <ched>, <fcel>, <ecel>.
+3. For every table:
+   - Output a single <otsl> enclosing the table coordinates.
+   - Produce header rows with <ched>.
+   - Produce every table cell with <fcel> ... </fcel> in row-major order, even on continuation pages.
+   - Do NOT leave <otsl> empty; always include the actual header/cell content.
+4. Preserve reading order from top-left to bottom-right.
+5. Finish only after closing </doctag>.
+Convert the provided page image into precise DocTags with complete table markup."""
 
 # v35: Enable TensorFloat32 tensor cores for faster float32 matrix multiplication
 # This addresses the warning: "TensorFloat32 tensor cores available but not enabled"
@@ -315,7 +319,8 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
     # v33: Added stop strings from Docling's vlm_model_specs.py
     sampling_params = SamplingParams(
         temperature=0.0,  # Deterministic
-        max_tokens=8192,  # IBM's recommended value for full DOCTAGS output
+        max_tokens=10000,  # Extra headroom to finish DocTags on continuation pages
+        repetition_penalty=1.05,  # Encourage Granite to keep emitting cell content
         skip_special_tokens=False,  # Preserve DOCTAGS
         stop=["</doctag>", "<|end_of_text|>"]  # v33: Docling's stop strings
     )
