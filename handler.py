@@ -17,7 +17,7 @@ Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
 - IBM recommendation: Direct vLLM for production (not Docling SDK)
 
-Build: 2025-12-16-v30-docling-core-parsing
+Build: 2025-12-17-v31-batch-processing
 """
 
 import runpod
@@ -60,11 +60,14 @@ def load_vllm():
         # With identical prompts across pages, cached KV state from Page 1 would be
         # incorrectly reused for Pages 2-4, causing truncated/empty outputs.
         # See: https://github.com/vllm-project/vllm/issues/20261
+        #
+        # v31: Reduced gpu_memory_utilization from 0.9 to 0.3 (Docling default)
+        # Batch processing needs more headroom for multiple images
         llm = LLM(
             model="ibm-granite/granite-docling-258M",
             revision="untied",  # CRITICAL - untied weights required
             limit_mm_per_prompt={"image": 1},  # CRITICAL - required for multimodal models
-            gpu_memory_utilization=0.9,
+            gpu_memory_utilization=0.3,  # v31: Reduced from 0.9 for batch processing
             max_model_len=8192,
             trust_remote_code=True,
             dtype="bfloat16",  # A4500/ADA GPUs support bfloat16
@@ -222,19 +225,19 @@ def combine_pages(page_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def process_pdf(pdf_base64: str) -> Dict[str, Any]:
     """
-    Process PDF with direct vLLM inference using SEQUENTIAL page processing.
+    Process PDF with direct vLLM inference using BATCH processing.
 
     Steps:
     1. Decode PDF bytes
     2. Render to RGB images (150 DPI, PPM format)
-    3. Process each page SEQUENTIALLY (not batched) to avoid encoder cache exhaustion
+    3. Process ALL pages in a SINGLE llm.generate() call (batch mode)
     4. Parse DOCTAGS output for each page
     5. Combine pages
 
-    NOTE: Sequential processing is required because vLLM's encoder cache (8192 tokens)
-    gets exhausted when processing multiple images in a single batch, causing
-    subsequent pages to produce empty OTSL output.
-    See: https://github.com/vllm-project/vllm/issues/20123
+    v31: Switched from sequential to batch processing.
+    Docling's official vLLM implementation uses batch processing.
+    Sequential processing in v30 caused pages 2-4 to return empty tables.
+    See: https://github.com/docling-project/docling/blob/main/docling/models/vlm_models_inline/vllm_model.py
     """
     from vllm import SamplingParams
 
@@ -267,48 +270,44 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
         skip_special_tokens=False  # Preserve DOCTAGS
     )
 
-    # Process pages SEQUENTIALLY to avoid encoder cache exhaustion
-    # Each generate() call gets a fresh encoder cache
-    logger.info(f"[GraniteDocling] Processing {len(rgb_images)} pages SEQUENTIALLY...")
+    # v31: BATCH processing - all pages in single generate() call
+    # This matches Docling's official vLLM implementation
+    logger.info(f"[GraniteDocling] Processing {len(rgb_images)} pages in BATCH mode...")
     inference_start = time.time()
-    results = []
+
+    # Build batch inputs for all pages
+    batched_inputs = []
+    prompt = proc.apply_chat_template(messages, add_generation_prompt=True)
+    logger.info(f"[GraniteDocling] Using prompt format: {prompt[:200]}...")
 
     for i, image in enumerate(rgb_images):
-        page_start = time.time()
-
-        # Use processor.apply_chat_template as per IBM documentation
-        prompt = proc.apply_chat_template(messages, add_generation_prompt=True)
-
-        # DEBUG: Log the prompt being used (only first page to avoid spam)
-        if i == 0:
-            logger.info(f"[GraniteDocling] Using prompt format: {prompt[:200]}...")
-
-        # Create single-page prompt
-        single_prompt = [{
+        batched_inputs.append({
             "prompt": prompt,
             "multi_modal_data": {"image": image}
-        }]
+        })
+        logger.info(f"[GraniteDocling] Added page {i+1} to batch")
 
-        # Process single page - fresh encoder cache for each page
-        logger.info(f"[GraniteDocling] Processing page {i+1}/{len(rgb_images)}...")
-        page_output = llm_client.generate(single_prompt, sampling_params=sampling_params)
+    # Single generate call for all pages (batch mode)
+    logger.info(f"[GraniteDocling] Running batch inference for {len(batched_inputs)} pages...")
+    outputs = llm_client.generate(batched_inputs, sampling_params=sampling_params)
 
-        # Extract DOCTAGS from output
-        doctags = page_output[0].outputs[0].text
-        page_time = time.time() - page_start
+    inference_time = time.time() - inference_start
+    logger.info(f"[GraniteDocling] Batch inference completed in {inference_time:.2f}s ({inference_time/len(rgb_images):.2f}s per page)")
 
-        logger.info(f"[GraniteDocling] Page {i+1} completed in {page_time:.2f}s: {len(doctags)} chars")
+    # Process each output
+    results = []
+    for i, output in enumerate(outputs):
+        doctags = output.outputs[0].text
+
+        logger.info(f"[GraniteDocling] Page {i+1}: {len(doctags)} chars")
         # DEBUG: Log first 500 chars of raw output to see actual format
         logger.info(f"[GraniteDocling] Page {i+1} raw output (first 500 chars): {doctags[:500]}")
         # DEBUG: Log last 200 chars to check if output is truncated
         logger.info(f"[GraniteDocling] Page {i+1} raw output (last 200 chars): {doctags[-200:]}")
 
         # Parse DOCTAGS for this page using docling-core (with image for location resolution)
-        parsed = parse_doctags_with_docling_core(doctags, image)
+        parsed = parse_doctags_with_docling_core(doctags, rgb_images[i])
         results.append(parsed)
-
-    inference_time = time.time() - inference_start
-    logger.info(f"[GraniteDocling] All pages completed in {inference_time:.2f}s ({inference_time/len(rgb_images):.2f}s per page)")
 
     # Combine pages
     combined = combine_pages(results)
