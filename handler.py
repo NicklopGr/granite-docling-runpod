@@ -8,7 +8,8 @@ Key Features:
 - Direct vLLM.LLM() client with untied weights
 - PDF rendered to RGB using pdf2image (no RGBA conversion)
 - docling-core for DocTags parsing (DocTagsDocument + DoclingDocument)
-- 150 DPI rendering (matches IBM benchmarks)
+- 144 DPI rendering (scale=2.0 × 72 base DPI, matches Docling defaults)
+- Max 3 pages per batch (SmolDocling paper limit)
 
 API Input: {"input": {"pdf_base64": "base64_encoded_pdf"}}
 API Output: {"status": "success", "result": {"markdown": "...", "tables": [...], "text_content": [...]}}
@@ -17,7 +18,7 @@ Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
 - IBM recommendation: Direct vLLM for production (not Docling SDK)
 
-Build: 2025-12-17-v32-transformers-backend
+Build: 2025-12-17-v33-docling-aligned
 """
 
 import runpod
@@ -102,10 +103,13 @@ def render_pdf_to_rgb(pdf_bytes: bytes) -> List[Image.Image]:
     logger.info("[GraniteDocling] Rendering PDF to RGB images...")
     start_time = time.time()
 
-    # Convert PDF to images - specify dpi for quality
+    # Convert PDF to images
+    # v33: Changed from 150 DPI to 144 DPI to match Docling's scale=2.0 setting
+    # Docling uses scale=2.0 which is 72 base DPI × 2 = 144 DPI
+    # See: https://github.com/docling-project/docling/blob/main/docling/datamodel/vlm_model_specs.py
     images = convert_from_bytes(
         pdf_bytes,
-        dpi=150,  # IBM benchmark tested at 150 DPI
+        dpi=144,  # v33: Match Docling's scale=2.0 (72 × 2 = 144 DPI)
         fmt='ppm'  # PPM format = RGB by default (no alpha channel)
     )
 
@@ -268,50 +272,67 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
     ]
 
     # Configure sampling
+    # v33: Added stop strings from Docling's vlm_model_specs.py
     sampling_params = SamplingParams(
         temperature=0.0,  # Deterministic
         max_tokens=8192,  # IBM's recommended value for full DOCTAGS output
-        skip_special_tokens=False  # Preserve DOCTAGS
+        skip_special_tokens=False,  # Preserve DOCTAGS
+        stop=["</doctag>", "<|end_of_text|>"]  # v33: Docling's stop strings
     )
 
-    # v31: BATCH processing - all pages in single generate() call
-    # This matches Docling's official vLLM implementation
-    logger.info(f"[GraniteDocling] Processing {len(rgb_images)} pages in BATCH mode...")
+    # v33: Process in batches of max 3 pages
+    # SmolDocling paper states: "up to three pages at a time" with 8192 token limit
+    # Processing more pages in a single batch can cause empty outputs for later pages
+    MAX_PAGES_PER_BATCH = 3
+
+    logger.info(f"[GraniteDocling] Processing {len(rgb_images)} pages (max {MAX_PAGES_PER_BATCH} per batch)...")
     inference_start = time.time()
 
-    # Build batch inputs for all pages
-    batched_inputs = []
     prompt = proc.apply_chat_template(messages, add_generation_prompt=True)
     logger.info(f"[GraniteDocling] Using prompt format: {prompt[:200]}...")
 
-    for i, image in enumerate(rgb_images):
-        batched_inputs.append({
-            "prompt": prompt,
-            "multi_modal_data": {"image": image}
-        })
-        logger.info(f"[GraniteDocling] Added page {i+1} to batch")
+    results = []
+    total_pages = len(rgb_images)
 
-    # Single generate call for all pages (batch mode)
-    logger.info(f"[GraniteDocling] Running batch inference for {len(batched_inputs)} pages...")
-    outputs = llm_client.generate(batched_inputs, sampling_params=sampling_params)
+    # Process pages in chunks of MAX_PAGES_PER_BATCH
+    for batch_start in range(0, total_pages, MAX_PAGES_PER_BATCH):
+        batch_end = min(batch_start + MAX_PAGES_PER_BATCH, total_pages)
+        batch_images = rgb_images[batch_start:batch_end]
+        batch_num = (batch_start // MAX_PAGES_PER_BATCH) + 1
+        total_batches = (total_pages + MAX_PAGES_PER_BATCH - 1) // MAX_PAGES_PER_BATCH
+
+        logger.info(f"[GraniteDocling] Batch {batch_num}/{total_batches}: Pages {batch_start+1}-{batch_end}")
+
+        # Build batch inputs for this chunk
+        batched_inputs = []
+        for i, image in enumerate(batch_images):
+            batched_inputs.append({
+                "prompt": prompt,
+                "multi_modal_data": {"image": image}
+            })
+            logger.info(f"[GraniteDocling] Added page {batch_start + i + 1} to batch")
+
+        # Single generate call for this batch
+        logger.info(f"[GraniteDocling] Running batch inference for {len(batched_inputs)} pages...")
+        outputs = llm_client.generate(batched_inputs, sampling_params=sampling_params)
+
+        # Process each output in this batch
+        for i, output in enumerate(outputs):
+            page_num = batch_start + i + 1
+            doctags = output.outputs[0].text
+
+            logger.info(f"[GraniteDocling] Page {page_num}: {len(doctags)} chars")
+            # DEBUG: Log first 500 chars of raw output to see actual format
+            logger.info(f"[GraniteDocling] Page {page_num} raw output (first 500 chars): {doctags[:500]}")
+            # DEBUG: Log last 200 chars to check if output is truncated
+            logger.info(f"[GraniteDocling] Page {page_num} raw output (last 200 chars): {doctags[-200:]}")
+
+            # Parse DOCTAGS for this page using docling-core (with image for location resolution)
+            parsed = parse_doctags_with_docling_core(doctags, batch_images[i])
+            results.append(parsed)
 
     inference_time = time.time() - inference_start
-    logger.info(f"[GraniteDocling] Batch inference completed in {inference_time:.2f}s ({inference_time/len(rgb_images):.2f}s per page)")
-
-    # Process each output
-    results = []
-    for i, output in enumerate(outputs):
-        doctags = output.outputs[0].text
-
-        logger.info(f"[GraniteDocling] Page {i+1}: {len(doctags)} chars")
-        # DEBUG: Log first 500 chars of raw output to see actual format
-        logger.info(f"[GraniteDocling] Page {i+1} raw output (first 500 chars): {doctags[:500]}")
-        # DEBUG: Log last 200 chars to check if output is truncated
-        logger.info(f"[GraniteDocling] Page {i+1} raw output (last 200 chars): {doctags[-200:]}")
-
-        # Parse DOCTAGS for this page using docling-core (with image for location resolution)
-        parsed = parse_doctags_with_docling_core(doctags, rgb_images[i])
-        results.append(parsed)
+    logger.info(f"[GraniteDocling] All batches completed in {inference_time:.2f}s ({inference_time/len(rgb_images):.2f}s per page)")
 
     # Combine pages
     combined = combine_pages(results)
