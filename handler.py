@@ -42,13 +42,14 @@ DOC_TAG_PROMPT = """You are Docling, an AI that converts document images into Do
 Follow this schema exactly:
 1. Begin with <doctag> and end with </doctag>.
 2. Emit layout tags such as <section_header_level_1>, <text>, <picture>, <otsl>, <ched>, <fcel>, <ecel>.
-3. For every table:
+3. For every table (including continuation pages):
    - Output a single <otsl> enclosing the table coordinates.
    - Produce header rows with <ched>.
-   - Produce every table cell with <fcel> ... </fcel> in row-major order, even on continuation pages.
-   - Do NOT leave <otsl> empty; always include the actual header/cell content.
-4. Preserve reading order from top-left to bottom-right.
-5. Finish only after closing </doctag>.
+   - Produce every table cell with <fcel> ... </fcel> in strict row-major order.
+   - Each <fcel> must contain the textual value for that cell. Never leave a cell empty and never omit debit/credit columns.
+   - Continuation pages must restate all columns (date, description, debit, credit, balance) exactly like the first page.
+4. If a source cell is blank, still emit <fcel></fcel> so downstream parsers know it was intentionally empty.
+5. Preserve reading order from top-left to bottom-right and finish only after closing </doctag>.
 Convert the provided page image into precise DocTags with complete table markup."""
 
 # v35: Enable TensorFloat32 tensor cores for faster float32 matrix multiplication
@@ -122,10 +123,10 @@ def render_pdf_to_rgb(pdf_bytes: bytes) -> List[Image.Image]:
     start_time = time.time()
 
     # Convert PDF to images
-    # Increase to 192 DPI for sharper tables (helps Granite detect gridlines)
+    # Increase to 240 DPI for sharper tables (helps Granite detect gridlines)
     images = convert_from_bytes(
         pdf_bytes,
-        dpi=192,
+        dpi=240,
         fmt='ppm'  # PPM format = RGB by default (no alpha channel)
     )
 
@@ -325,10 +326,8 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
         stop=["</doctag>", "<|end_of_text|>"]  # v33: Docling's stop strings
     )
 
-    # v36: With enforce_eager (no CUDA graphs), memory is more predictable
-    # Model is only 258M params (~600MB), can handle larger batches
-    # RTX 4090 (24GB) / Ada 6000 (48GB) easily support 10+ page batches
-    MAX_PAGES_PER_BATCH = 10
+    # Force single-page batches (matches transformers.js demo) to avoid continuation loss
+    MAX_PAGES_PER_BATCH = 1
 
     logger.info(f"[GraniteDocling] Processing {len(rgb_images)} pages (max {MAX_PAGES_PER_BATCH} per batch)...")
     inference_start = time.time()
