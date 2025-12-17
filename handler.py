@@ -2,15 +2,15 @@
 Granite-Docling-258M RunPod Serverless Handler (Direct vLLM Inference)
 
 Uses direct vLLM API following IBM's recommended production approach.
-Uses docling-core for proper DocTags -> Markdown conversion.
+Uses docling-core for proper DocTags -> Markdown conversion plus PaddleOCR-VL fallback for continuation tables.
 
 Key Features:
 - Direct vLLM.LLM() client with untied weights
 - PDF rendered to RGB using pdf2image (no RGBA conversion)
 - docling-core for DocTags parsing (DocTagsDocument + DoclingDocument)
-- 144 DPI rendering (scale=2.0 × 72 base DPI, matches Docling defaults)
+- 192 DPI rendering for sharper table detection
 - Max 10 pages per vLLM batch (memory optimization)
-- v37: Multi-page docling-core parsing (all pages at once for cross-page table context)
+- Paged docling-core parsing + PaddleOCR-VL fallback for empty tables
 
 API Input: {"input": {"pdf_base64": "base64_encoded_pdf"}}
 API Output: {"status": "success", "result": {"markdown": "...", "tables": [...], "text_content": [...]}}
@@ -19,20 +19,24 @@ Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
 - IBM recommendation: Direct vLLM for production (not Docling SDK)
 
-Build: 2025-12-17-v38-debug-tables
+Build: 2025-12-17-v39-paddle-fallback
 """
 
 import runpod
 import base64
+import io
 import os
 import time
 import traceback
 import json
 import logging
 import re
-from typing import List, Dict, Any
+import html
+from html.parser import HTMLParser
+from typing import List, Dict, Any, Optional, Tuple
 from PIL import Image
 import torch
+import requests
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -47,6 +51,51 @@ Follow this schema exactly:
 - Preserve the reading order from top-left to bottom-right.
 Convert the provided page image into DocTags with accurate table markup."""
 
+# Optional PaddleOCR-VL fallback (cropped table recovery)
+PADDLE_VL_ENDPOINT_ID = os.getenv("PADDLE_VL_ENDPOINT_ID")
+PADDLE_VL_API_KEY = os.getenv("PADDLE_VL_API_KEY") or os.getenv("RUNPOD_API_KEY")
+PADDLE_VL_TIMEOUT = int(os.getenv("PADDLE_VL_TIMEOUT", "60"))
+PADDLE_VL_PADDING = int(os.getenv("PADDLE_VL_PADDING", "16"))
+
+# DocTags coordinate helpers
+MAX_DOCTAG_COORD = 512.0
+OTS_REGION_PATTERN = re.compile(r"<otsl>(.*?)</otsl>", re.DOTALL)
+LOC_PATTERN = re.compile(r"<loc_(\d+)>")
+
+
+class SimpleHTMLTableParser(HTMLParser):
+    """Minimal HTML table parser to convert Paddle outputs into Markdown."""
+
+    def __init__(self):
+        super().__init__()
+        self.rows: List[List[str]] = []
+        self._current_row: List[str] = []
+        self._current_cell: List[str] = []
+        self._in_cell = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "tr":
+            self._current_row = []
+        elif tag in ("td", "th"):
+            self._current_cell = []
+            self._in_cell = True
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th"):
+            text = html.unescape(''.join(self._current_cell).strip())
+            self._current_row.append(text)
+            self._current_cell = []
+            self._in_cell = False
+        elif tag == "tr":
+            if any(cell.strip() for cell in self._current_row):
+                self.rows.append(self._current_row)
+            self._current_row = []
+
+    def handle_data(self, data):
+        if self._in_cell:
+            self._current_cell.append(data)
+
+
 # v35: Enable TensorFloat32 tensor cores for faster float32 matrix multiplication
 # This addresses the warning: "TensorFloat32 tensor cores available but not enabled"
 # TF32 uses 19-bit precision (vs 32-bit) for 8x faster matmul with minimal accuracy loss
@@ -55,16 +104,14 @@ logger.info("[GraniteDocling] TF32 tensor cores enabled (float32_matmul_precisio
 
 # Global vLLM client - loaded once, reused across requests
 llm = None
-processor = None
 
 
 def load_vllm():
     """Load vLLM with Granite-Docling-258M (untied weights)."""
-    global llm, processor
+    global llm
 
     if llm is None:
-        from vllm import LLM, SamplingParams
-        from transformers import AutoProcessor
+        from vllm import LLM
 
         logger.info("[GraniteDocling] Loading vLLM with direct inference...")
         logger.info("[GraniteDocling] Model: ibm-granite/granite-docling-258M (untied)")
@@ -93,17 +140,10 @@ def load_vllm():
             # Let vLLM auto-detect: dtype, gpu_memory_utilization (0.9), max_model_len
         )
 
-        # Load processor for prompt formatting
-        processor = AutoProcessor.from_pretrained(
-            "ibm-granite/granite-docling-258M",
-            revision="untied",
-            trust_remote_code=True
-        )
-
         elapsed = time.time() - start_time
         logger.info(f"[GraniteDocling] vLLM loaded in {elapsed:.2f}s")
 
-    return llm, processor
+    return llm
 
 
 def render_pdf_to_rgb(pdf_bytes: bytes) -> List[Image.Image]:
@@ -143,10 +183,232 @@ def render_pdf_to_rgb(pdf_bytes: bytes) -> List[Image.Image]:
     return rgb_images
 
 
+def extract_table_regions_from_doctags(
+    doctags_text: str,
+    width: int,
+    height: int
+) -> List[Dict[str, float]]:
+    """Parse <otsl> regions from DocTags and map them to pixel coordinates."""
+    regions: List[Dict[str, float]] = []
+    if not doctags_text:
+        return regions
+
+    for match in OTS_REGION_PATTERN.finditer(doctags_text):
+        locs = LOC_PATTERN.findall(match.group(1))
+        if len(locs) < 4:
+            continue
+        coords = [max(0.0, min(MAX_DOCTAG_COORD, float(value))) for value in locs[:4]]
+        x1, y1, x2, y2 = coords
+        regions.append({
+            "x1": (x1 / MAX_DOCTAG_COORD) * width,
+            "y1": (y1 / MAX_DOCTAG_COORD) * height,
+            "x2": (x2 / MAX_DOCTAG_COORD) * width,
+            "y2": (y2 / MAX_DOCTAG_COORD) * height,
+        })
+
+    return regions
+
+
+def table_html_to_markdown(html_table: str) -> Tuple[str, int]:
+    """Convert Paddle's HTML table snippet into Markdown."""
+    parser = SimpleHTMLTableParser()
+    parser.feed(html_table or "")
+    parser.close()
+
+    if not parser.rows:
+        return "", 0
+
+    col_count = max(len(row) for row in parser.rows)
+    normalized_rows = [
+        row + [""] * (col_count - len(row))
+        for row in parser.rows
+    ]
+
+    header = normalized_rows[0]
+    body = normalized_rows[1:] if len(normalized_rows) > 1 else []
+    header_line = "| " + " | ".join(header) + " |"
+    separator_line = "| " + " | ".join(["---"] * col_count) + " |"
+    body_lines = ["| " + " | ".join(row) + " |" for row in body]
+
+    markdown = "\n".join([header_line, separator_line] + body_lines)
+    return markdown.strip(), len(body)
+
+
+def crop_image_to_bbox(
+    image: Image.Image,
+    bbox: Dict[str, float],
+    padding: int
+) -> Optional[Image.Image]:
+    """Crop PIL image to bounding box with optional padding."""
+    width, height = image.size
+    x1 = max(0, int(bbox.get("x1", 0)) - padding)
+    y1 = max(0, int(bbox.get("y1", 0)) - padding)
+    x2 = min(width, int(bbox.get("x2", width)) + padding)
+    y2 = min(height, int(bbox.get("y2", height)) + padding)
+
+    if x1 >= x2 or y1 >= y2:
+        return None
+
+    return image.crop((x1, y1, x2, y2))
+
+
+def image_to_base64(image: Image.Image) -> str:
+    """Encode PIL image as base64 PNG."""
+    buffer = io.BytesIO()
+    image.save(buffer, format='PNG')
+    return base64.b64encode(buffer.getvalue()).decode('utf-8')
+
+
+def call_paddle_vl(image_base64: str) -> Optional[Dict[str, Any]]:
+    """Invoke PaddleOCR-VL RunPod endpoint synchronously."""
+    if not (PADDLE_VL_ENDPOINT_ID and PADDLE_VL_API_KEY):
+        return None
+
+    url = f"https://api.runpod.ai/v2/{PADDLE_VL_ENDPOINT_ID}/runsync"
+    headers = {
+        "Authorization": f"Bearer {PADDLE_VL_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json={"input": {"image_base64": image_base64}},
+            timeout=PADDLE_VL_TIMEOUT
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as err:
+        logger.warning(f"[GraniteDocling] PaddleOCR-VL request failed: {err}")
+        return None
+
+    output = payload.get("output") or {}
+    result = output.get("result") or output
+    if isinstance(result, dict) and "pages" in result:
+        pages = result.get("pages")
+    else:
+        pages = None
+
+    if not pages and isinstance(output, dict) and "pages" in output:
+        pages = output.get("pages")
+
+    if pages and isinstance(pages, list) and pages:
+        return pages[0]
+
+    logger.warning("[GraniteDocling] PaddleOCR-VL response did not include pages")
+    return None
+
+
+def extract_table_from_paddle_page(page_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Extract the first table from Paddle OCR raw output."""
+    raw = page_data.get("raw", {})
+    parsing_list = raw.get("res", {}).get("parsing_res_list", [])
+
+    candidates = []
+    if isinstance(parsing_list, list):
+        for block in parsing_list:
+            if (
+                isinstance(block, dict)
+                and block.get("block_label") == "table"
+                and block.get("block_content")
+            ):
+                markdown, row_count = table_html_to_markdown(block["block_content"])
+                if markdown:
+                    candidates.append({"markdown": markdown, "row_count": row_count})
+
+    if not candidates:
+        blocks = page_data.get("blocks", [])
+        if isinstance(blocks, list):
+            for block in blocks:
+                if (
+                    isinstance(block, dict)
+                    and block.get("block_label") == "table"
+                    and block.get("block_content")
+                ):
+                    markdown, row_count = table_html_to_markdown(block["block_content"])
+                    if markdown:
+                        candidates.append({"markdown": markdown, "row_count": row_count})
+                        break
+
+    return candidates[0] if candidates else None
+
+
+def recover_table_with_paddle(
+    image: Image.Image,
+    bbox: Dict[str, float],
+    page_number: int,
+    table_number: int
+) -> Optional[Dict[str, Any]]:
+    """Crop table region and attempt to recover rows using PaddleOCR-VL."""
+    cropped = crop_image_to_bbox(image, bbox, PADDLE_VL_PADDING)
+    if cropped is None:
+        logger.warning(f"[GraniteDocling] Cannot crop bbox for page {page_number}, table {table_number}")
+        return None
+
+    paddle_page = call_paddle_vl(image_to_base64(cropped))
+    if not paddle_page:
+        return None
+
+    table_data = extract_table_from_paddle_page(paddle_page)
+    if table_data:
+        logger.info(
+            f"[GraniteDocling] Paddle fallback recovered page {page_number} table {table_number} "
+            f"with {table_data['row_count']} rows"
+        )
+        return table_data
+
+    logger.warning(f"[GraniteDocling] Paddle fallback returned no tables for page {page_number}, table {table_number}")
+    return None
+
+
+def apply_paddle_fallback(
+    page_results: List[Dict[str, Any]],
+    page_images: List[Image.Image]
+) -> int:
+    """Run Paddle fallback for tables with zero rows, returns recovered count."""
+    if not (PADDLE_VL_ENDPOINT_ID and PADDLE_VL_API_KEY):
+        logger.info("[GraniteDocling] Paddle fallback not configured; skipping")
+        return 0
+
+    recovered = 0
+    for idx, page in enumerate(page_results):
+        image = page_images[idx]
+        for table in page.get("tables", []):
+            if table.get("row_count", 0) > 0:
+                continue
+            bbox = table.get("bbox")
+            if not bbox:
+                logger.warning(
+                    f"[GraniteDocling] No bbox for page {page.get('page_number')} table {table.get('table_number')}, "
+                    "cannot run Paddle fallback"
+                )
+                continue
+
+            fallback_data = recover_table_with_paddle(
+                image,
+                bbox,
+                page.get("page_number", idx + 1),
+                table.get("table_number", 0)
+            )
+            if fallback_data and fallback_data.get("markdown"):
+                table["markdown"] = fallback_data["markdown"]
+                table["row_count"] = fallback_data["row_count"]
+                table["source"] = "paddle-ocr-vl"
+                table["recovered"] = True
+                page_markdown = page.get("markdown") or ""
+                addition = f"\n\n{fallback_data['markdown']}"
+                page["markdown"] = (page_markdown + addition).strip() if page_markdown else fallback_data["markdown"]
+                recovered += 1
+
+    return recovered
+
+
 def parse_page_with_docling_core(
     doctags_text: str,
     image: Image.Image,
-    page_number: int
+    page_number: int,
+    table_regions: List[Dict[str, float]]
 ) -> Dict[str, Any]:
     """
     Parse a single page of DocTags using docling-core.
@@ -156,7 +418,7 @@ def parse_page_with_docling_core(
     from docling_core.types.doc import DoclingDocument
     from docling_core.types.doc.document import DocTagsDocument
 
-    logger.info(f"[GraniteDocling] v38: Parsing page {page_number} with docling-core")
+    logger.info(f"[GraniteDocling] v39: Parsing page {page_number} with docling-core")
 
     try:
         doctags_doc = DocTagsDocument.from_doctags_and_image_pairs([doctags_text], [image])
@@ -170,34 +432,37 @@ def parse_page_with_docling_core(
         text_content = []
 
         if hasattr(doc, 'tables') and doc.tables:
-            logger.info(f"[GraniteDocling] v38: Found {len(doc.tables)} tables on page {page_number}")
+            logger.info(f"[GraniteDocling] v39: Found {len(doc.tables)} tables on page {page_number}")
             for i, table in enumerate(doc.tables):
                 try:
-                    logger.info(f"[GraniteDocling] v38: Processing table {i + 1}/{len(doc.tables)} on page {page_number}")
+                    logger.info(f"[GraniteDocling] v39: Processing table {i + 1}/{len(doc.tables)} on page {page_number}")
 
                     table_md = ""
                     if hasattr(table, 'export_to_markdown'):
                         try:
                             table_md = table.export_to_markdown(doc=doc)
                         except TypeError as te:
-                            logger.warning(f"[GraniteDocling] v38: Table {i+1} export_to_markdown(doc=doc) failed on page {page_number}: {te}")
+                            logger.warning(f"[GraniteDocling] v39: Table {i+1} export_to_markdown(doc=doc) failed on page {page_number}: {te}")
                             table_md = table.export_to_markdown()
                     else:
                         table_md = str(table)
 
                     row_count = len(table_md.strip().split('\n')) - 1 if table_md else 0
-                    tables.append({
+                    table_info = {
                         "table_number": i + 1,
                         "markdown": table_md,
                         "row_count": row_count,
                         "page_number": page_number
-                    })
+                    }
+                    if i < len(table_regions):
+                        table_info["bbox"] = table_regions[i]
+                    tables.append(table_info)
                     logger.info(f"[GraniteDocling] Table {i+1} on page {page_number}: {row_count} rows")
                     if row_count == 0 or not table_md.strip():
-                        logger.warning(f"[GraniteDocling] v38: Table {i+1} markdown empty on page {page_number} (likely continuation)")
+                        logger.warning(f"[GraniteDocling] v39: Table {i+1} markdown empty on page {page_number} (likely continuation)")
 
                 except Exception as table_error:
-                    logger.exception(f"[GraniteDocling] v38: FAILED processing table {i+1} on page {page_number}: {table_error}")
+                    logger.exception(f"[GraniteDocling] v39: FAILED processing table {i+1} on page {page_number}: {table_error}")
                     tables.append({
                         "table_number": i + 1,
                         "markdown": "",
@@ -222,7 +487,9 @@ def parse_page_with_docling_core(
             "text_content": text_content,
             "markdown": markdown,
             "raw_doctags": doctags_text,
-            "page_number": page_number
+            "page_number": page_number,
+            "table_regions": table_regions,
+            "image_size": image.size
         }
 
     except Exception as e:
@@ -233,7 +500,9 @@ def parse_page_with_docling_core(
             "markdown": doctags_text,
             "raw_doctags": doctags_text,
             "page_number": page_number,
-            "error": str(e)
+            "error": str(e),
+            "table_regions": table_regions,
+            "image_size": image.size
         }
 
 
@@ -290,7 +559,7 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
     from vllm import SamplingParams
 
     # Load vLLM client
-    llm_client, proc = load_vllm()
+    llm_client = load_vllm()
 
     # Decode PDF
     logger.info("[GraniteDocling] Decoding PDF...")
@@ -299,17 +568,6 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
 
     # Render to RGB
     rgb_images = render_pdf_to_rgb(pdf_bytes)
-
-    # IBM's official message format for granite-docling
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": DOC_TAG_PROMPT}
-            ],
-        },
-    ]
 
     # Configure sampling
     # v33: Added stop strings from Docling's vlm_model_specs.py
@@ -328,7 +586,7 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
     logger.info(f"[GraniteDocling] Processing {len(rgb_images)} pages (max {MAX_PAGES_PER_BATCH} per batch)...")
     inference_start = time.time()
 
-    prompt = proc.apply_chat_template(messages, add_generation_prompt=True)
+    prompt = f"<|start_of_role|>user<|end_of_role|><image>\n{DOC_TAG_PROMPT.strip()}\n<|end_of_text|>"
     logger.info(f"[GraniteDocling] Using prompt format: {prompt[:200]}...")
 
     # Collect all doctags/images first, then parse page-by-page
@@ -377,16 +635,31 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
     logger.info(f"[GraniteDocling] vLLM inference completed in {inference_time:.2f}s ({inference_time/len(rgb_images):.2f}s per page)")
 
     # Parse each page independently (matches transformers.js demo behavior)
-    logger.info(f"[GraniteDocling] v38: Parsing {len(all_doctags)} pages individually with docling-core...")
+    logger.info(f"[GraniteDocling] v39: Parsing {len(all_doctags)} pages individually with docling-core...")
     parse_start = time.time()
     page_results = []
     for page_idx, (doctags, image) in enumerate(zip(all_doctags, all_images_for_parsing), start=1):
-        page_results.append(parse_page_with_docling_core(doctags, image, page_idx))
+        table_regions = extract_table_regions_from_doctags(doctags, image.width, image.height)
+        page_results.append(parse_page_with_docling_core(doctags, image, page_idx, table_regions))
 
     parse_time = time.time() - parse_start
     logger.info(f"[GraniteDocling] docling-core page-by-page parsing completed in {parse_time:.2f}s")
 
+    empty_tables_before = sum(
+        1
+        for page in page_results
+        for table in page.get("tables", [])
+        if table.get("row_count", 0) == 0
+    )
+    paddle_recovered = apply_paddle_fallback(page_results, all_images_for_parsing)
+    if paddle_recovered:
+        logger.info(f"[GraniteDocling] Paddle fallback recovered {paddle_recovered} table(s)")
+
     combined = combine_pages(page_results)
+    combined["fallback_summary"] = {
+        "empty_tables_before_fallback": empty_tables_before,
+        "paddle_recovered_tables": paddle_recovered
+    }
     return combined, inference_time, len(rgb_images)
 
 
@@ -415,12 +688,15 @@ def handler(event):
         logger.info(f"[GraniteDocling]   - Inference time: {inference_time:.2f}s")
         logger.info(f"[GraniteDocling]   - Total time: {total_time:.2f}s")
 
-        return {
+        fallback_summary = result.get("fallback_summary") or {}
+        response_payload = {
             "status": "success",
             "result": {
                 "markdown": result["markdown"],
                 "tables": result["tables"],
                 "text_content": result["text_content"],
+                "raw_doctags": result.get("raw_doctags"),
+                "fallback_summary": fallback_summary,
                 "metadata": {
                     "model": "granite-docling-258M",
                     "pipeline": "direct-vllm",
@@ -434,6 +710,10 @@ def handler(event):
                 }
             }
         }
+        if fallback_summary:
+            response_payload["result"]["metadata"]["fallback"] = fallback_summary
+
+        return response_payload
 
     except Exception as e:
         logger.error(f"[GraniteDocling] Error: {e}")
