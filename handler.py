@@ -9,7 +9,7 @@ Key Features:
 - PDF rendered to RGB using pdf2image (no RGBA conversion)
 - docling-core for DocTags parsing (DocTagsDocument + DoclingDocument)
 - 144 DPI rendering (scale=2.0 × 72 base DPI, matches Docling defaults)
-- Max 3 pages per batch (SmolDocling paper limit)
+- Max 3 pages per vLLM batch (memory optimization)
 
 API Input: {"input": {"pdf_base64": "base64_encoded_pdf"}}
 API Output: {"status": "success", "result": {"markdown": "...", "tables": [...], "text_content": [...]}}
@@ -280,9 +280,9 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
         stop=["</doctag>", "<|end_of_text|>"]  # v33: Docling's stop strings
     )
 
-    # v33: Process in batches of max 3 pages
-    # SmolDocling paper states: "up to three pages at a time" with 8192 token limit
-    # Processing more pages in a single batch can cause empty outputs for later pages
+    # v33: Process in batches of max 3 pages for memory optimization
+    # Each page is processed independently (limit_mm_per_prompt=1), but batching
+    # too many parallel inferences can cause vLLM memory issues
     MAX_PAGES_PER_BATCH = 3
 
     logger.info(f"[GraniteDocling] Processing {len(rgb_images)} pages (max {MAX_PAGES_PER_BATCH} per batch)...")
