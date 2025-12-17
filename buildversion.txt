@@ -1,1 +1,1 @@
-2025-12-16-v29-disable-prefix-cache
+2025-12-16-v30-docling-core-parsing

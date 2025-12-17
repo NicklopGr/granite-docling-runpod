@@ -40,12 +40,14 @@ RUN pip install --upgrade pip setuptools wheel && \
 RUN pip install vllm
 
 # Install dependencies for PDF rendering and processing
+# docling-core is required for proper DocTags -> Markdown conversion
 RUN pip install \
     pdf2image \
     pillow \
     transformers \
     runpod \
-    accelerate
+    accelerate \
+    docling-core
 
 # Pre-download the Granite-Docling model during build (reduces cold start time)
 RUN python -c "\
