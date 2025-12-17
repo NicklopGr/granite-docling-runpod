@@ -18,7 +18,7 @@ Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
 - IBM recommendation: Direct vLLM for production (not Docling SDK)
 
-Build: 2025-12-17-v34-vllm-defaults
+Build: 2025-12-17-v36-eager-tf32
 """
 
 import runpod
@@ -31,10 +31,17 @@ import logging
 import re
 from typing import List, Dict, Any
 from PIL import Image
+import torch
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
+
+# v35: Enable TensorFloat32 tensor cores for faster float32 matrix multiplication
+# This addresses the warning: "TensorFloat32 tensor cores available but not enabled"
+# TF32 uses 19-bit precision (vs 32-bit) for 8x faster matmul with minimal accuracy loss
+torch.set_float32_matmul_precision('high')
+logger.info("[GraniteDocling] TF32 tensor cores enabled (float32_matmul_precision='high')")
 
 # Global vLLM client - loaded once, reused across requests
 llm = None
@@ -61,10 +68,15 @@ def load_vllm():
         #      - limit_mm_per_prompt: Required for multimodal models
         #      - enable_prefix_caching=False: Prevents KV cache reuse across different images
         #      See: https://github.com/docling-project/docling/blob/main/docling/models/vlm_models_inline/vllm_model.py
+        # v36: Add enforce_eager=True to disable CUDA graph compilation
+        # Docling's vllm_model.py uses this exact configuration - without it,
+        # Transformers backend triggers 10+ minute CUDA graph compilation
+        # See: https://github.com/docling-project/docling/blob/main/docling/models/vlm_models_inline/vllm_model.py
         llm = LLM(
             model="ibm-granite/granite-docling-258M",
             revision="untied",  # CRITICAL - untied weights required
             model_impl="transformers",  # CRITICAL - use Transformers backend for Idefics3
+            enforce_eager=True,  # CRITICAL - disable CUDA graphs (matches Docling)
             limit_mm_per_prompt={"image": 1},  # CRITICAL - required for multimodal models
             trust_remote_code=True,
             enable_prefix_caching=False  # CRITICAL - disable for multimodal
@@ -272,10 +284,10 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
         stop=["</doctag>", "<|end_of_text|>"]  # v33: Docling's stop strings
     )
 
-    # v33: Process in batches of max 3 pages for memory optimization
-    # Each page is processed independently (limit_mm_per_prompt=1), but batching
-    # too many parallel inferences can cause vLLM memory issues
-    MAX_PAGES_PER_BATCH = 3
+    # v36: With enforce_eager (no CUDA graphs), memory is more predictable
+    # Model is only 258M params (~600MB), can handle larger batches
+    # RTX 4090 (24GB) / Ada 6000 (48GB) easily support 10+ page batches
+    MAX_PAGES_PER_BATCH = 10
 
     logger.info(f"[GraniteDocling] Processing {len(rgb_images)} pages (max {MAX_PAGES_PER_BATCH} per batch)...")
     inference_start = time.time()
