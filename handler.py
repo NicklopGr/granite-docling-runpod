@@ -45,8 +45,7 @@ Follow this schema exactly:
 3. For every table (including continuation pages):
    - Output a single <otsl> enclosing the table coordinates.
    - Produce header rows with <ched>.
-   - Produce every table cell with <fcel> ... </fcel> in strict row-major order (never split a logical row across multiple <tr> entries).
-   - Pack complete descriptions inside a single <fcel>, even if they include masked account numbers or multiple lines—do not emit those as separate rows.
+   - Produce every table cell with <fcel> ... </fcel> in strict row-major order.
    - Each <fcel> must contain the textual value for that cell. Never leave a cell empty and never omit debit/credit columns.
    - Continuation pages must restate all columns (date, description, debit, credit, balance) exactly like the first page.
 4. If a source cell is blank, still emit <fcel></fcel> so downstream parsers know it was intentionally empty.
