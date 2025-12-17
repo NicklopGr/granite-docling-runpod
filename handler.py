@@ -9,7 +9,8 @@ Key Features:
 - PDF rendered to RGB using pdf2image (no RGBA conversion)
 - docling-core for DocTags parsing (DocTagsDocument + DoclingDocument)
 - 144 DPI rendering (scale=2.0 × 72 base DPI, matches Docling defaults)
-- Max 3 pages per vLLM batch (memory optimization)
+- Max 10 pages per vLLM batch (memory optimization)
+- v37: Multi-page docling-core parsing (all pages at once for cross-page table context)
 
 API Input: {"input": {"pdf_base64": "base64_encoded_pdf"}}
 API Output: {"status": "success", "result": {"markdown": "...", "tables": [...], "text_content": [...]}}
@@ -18,7 +19,7 @@ Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
 - IBM recommendation: Direct vLLM for production (not Docling SDK)
 
-Build: 2025-12-17-v36-eager-tf32
+Build: 2025-12-17-v37-multipage-docling
 """
 
 import runpod
@@ -135,9 +136,14 @@ def render_pdf_to_rgb(pdf_bytes: bytes) -> List[Image.Image]:
     return rgb_images
 
 
-def parse_doctags_with_docling_core(doctags_text: str, image: Image.Image) -> Dict[str, Any]:
+def parse_all_doctags_with_docling_core(all_doctags: List[str], all_images: List[Image.Image]) -> Dict[str, Any]:
     """
-    Parse DocTags output using docling-core library (IBM's official approach).
+    Parse ALL DocTags outputs at once using docling-core library (IBM's official approach).
+
+    v37: CRITICAL FIX - Parse entire document at once instead of page-by-page.
+    Docling's VLM pipeline expects the full document so its global table heuristics
+    can run across all pages. Page-by-page parsing was causing empty tables on pages 2+
+    because continuation tables need context from page 1's header structure.
 
     This properly handles the location tokens (<loc_X>) and converts
     the raw DocTags output to structured Markdown with tables extracted.
@@ -145,10 +151,12 @@ def parse_doctags_with_docling_core(doctags_text: str, image: Image.Image) -> Di
     from docling_core.types.doc import DoclingDocument
     from docling_core.types.doc.document import DocTagsDocument
 
+    logger.info(f"[GraniteDocling] v37: Parsing {len(all_doctags)} pages with docling-core (multi-page mode)")
+
     try:
-        # Use docling-core to parse DocTags with image context
-        # This handles location tokens and reconstructs proper structure
-        doctags_doc = DocTagsDocument.from_doctags_and_image_pairs([doctags_text], [image])
+        # v37: Pass ALL pages at once to docling-core
+        # This allows cross-page table heuristics to work properly
+        doctags_doc = DocTagsDocument.from_doctags_and_image_pairs(all_doctags, all_images)
         doc = DoclingDocument.load_from_doctags(doctags_doc, document_name="Document")
 
         # Export to markdown
@@ -161,7 +169,8 @@ def parse_doctags_with_docling_core(doctags_text: str, image: Image.Image) -> Di
         # DoclingDocument has structured access to tables
         if hasattr(doc, 'tables') and doc.tables:
             for i, table in enumerate(doc.tables):
-                table_md = table.export_to_markdown() if hasattr(table, 'export_to_markdown') else str(table)
+                # v37: Pass doc to export_to_markdown to avoid deprecation warning
+                table_md = table.export_to_markdown(doc=doc) if hasattr(table, 'export_to_markdown') else str(table)
                 row_count = len(table_md.strip().split('\n')) - 1 if table_md else 0  # Exclude header separator
                 tables.append({
                     "table_number": i + 1,
@@ -185,18 +194,20 @@ def parse_doctags_with_docling_core(doctags_text: str, image: Image.Image) -> Di
             "tables": tables,
             "text_content": text_content,
             "markdown": markdown,
-            "raw_doctags": doctags_text
+            "raw_doctags": all_doctags
         }
 
     except Exception as e:
         logger.error(f"[GraniteDocling] docling-core parsing failed: {e}")
+        logger.error(f"[GraniteDocling] Error details: {traceback.format_exc()}")
         logger.info("[GraniteDocling] Falling back to raw DocTags output")
         # Fallback: return raw doctags as text
+        combined_doctags = "\n\n--- Page Break ---\n\n".join(all_doctags)
         return {
             "tables": [],
-            "text_content": [{"text": doctags_text, "type": "raw_doctags"}],
-            "markdown": doctags_text,
-            "raw_doctags": doctags_text
+            "text_content": [{"text": combined_doctags, "type": "raw_doctags"}],
+            "markdown": combined_doctags,
+            "raw_doctags": all_doctags
         }
 
 
@@ -241,14 +252,13 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
 
     Steps:
     1. Decode PDF bytes
-    2. Render to RGB images (150 DPI, PPM format)
-    3. Process ALL pages in a SINGLE llm.generate() call (batch mode)
-    4. Parse DOCTAGS output for each page
-    5. Combine pages
+    2. Render to RGB images (144 DPI, PPM format)
+    3. Process ALL pages in batched llm.generate() calls
+    4. v37: Collect ALL DocTags, then parse with docling-core ONCE (multi-page mode)
+    5. Return combined result
 
     v31: Switched from sequential to batch processing.
-    Docling's official vLLM implementation uses batch processing.
-    Sequential processing in v30 caused pages 2-4 to return empty tables.
+    v37: Parse all pages at once with docling-core for cross-page table context.
     See: https://github.com/docling-project/docling/blob/main/docling/models/vlm_models_inline/vllm_model.py
     """
     from vllm import SamplingParams
@@ -295,10 +305,12 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
     prompt = proc.apply_chat_template(messages, add_generation_prompt=True)
     logger.info(f"[GraniteDocling] Using prompt format: {prompt[:200]}...")
 
-    results = []
+    # v37: Collect ALL doctags and images first, then parse together
+    all_doctags = []
+    all_images_for_parsing = []
     total_pages = len(rgb_images)
 
-    # Process pages in chunks of MAX_PAGES_PER_BATCH
+    # Process pages in chunks of MAX_PAGES_PER_BATCH (vLLM inference)
     for batch_start in range(0, total_pages, MAX_PAGES_PER_BATCH):
         batch_end = min(batch_start + MAX_PAGES_PER_BATCH, total_pages)
         batch_images = rgb_images[batch_start:batch_end]
@@ -320,7 +332,7 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
         logger.info(f"[GraniteDocling] Running batch inference for {len(batched_inputs)} pages...")
         outputs = llm_client.generate(batched_inputs, sampling_params=sampling_params)
 
-        # Process each output in this batch
+        # v37: Collect outputs instead of parsing immediately
         for i, output in enumerate(outputs):
             page_num = batch_start + i + 1
             doctags = output.outputs[0].text
@@ -331,17 +343,22 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
             # DEBUG: Log last 200 chars to check if output is truncated
             logger.info(f"[GraniteDocling] Page {page_num} raw output (last 200 chars): {doctags[-200:]}")
 
-            # Parse DOCTAGS for this page using docling-core (with image for location resolution)
-            parsed = parse_doctags_with_docling_core(doctags, batch_images[i])
-            results.append(parsed)
+            # v37: Collect for batch parsing
+            all_doctags.append(doctags)
+            all_images_for_parsing.append(batch_images[i])
 
     inference_time = time.time() - inference_start
-    logger.info(f"[GraniteDocling] All batches completed in {inference_time:.2f}s ({inference_time/len(rgb_images):.2f}s per page)")
+    logger.info(f"[GraniteDocling] vLLM inference completed in {inference_time:.2f}s ({inference_time/len(rgb_images):.2f}s per page)")
 
-    # Combine pages
-    combined = combine_pages(results)
+    # v37: Parse ALL pages at once with docling-core
+    # This is the critical fix - docling-core needs all pages together for cross-page table heuristics
+    logger.info(f"[GraniteDocling] v37: Parsing all {len(all_doctags)} pages together with docling-core...")
+    parse_start = time.time()
+    result = parse_all_doctags_with_docling_core(all_doctags, all_images_for_parsing)
+    parse_time = time.time() - parse_start
+    logger.info(f"[GraniteDocling] docling-core parsing completed in {parse_time:.2f}s")
 
-    return combined, inference_time, len(rgb_images)
+    return result, inference_time, len(rgb_images)
 
 
 def handler(event):

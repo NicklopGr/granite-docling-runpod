@@ -1,13 +1,17 @@
 # Granite-Docling-258M RunPod Serverless
 
-Production-quality document understanding using IBM's Granite-Docling-258M with the official Docling SDK VlmPipeline.
+Production-grade Granite-Docling-258M serving that mirrors IBM’s recommended direct **vLLM** deployment:
+
+- PDFs are rendered at 144 DPI, batched (up to 10 pages), and fed directly into `vllm.LLM`.
+- `docling-core` converts the generated DocTags into Markdown/tables so downstream services can stay unchanged.
+- No Docling SDK server is embedded here—the FIN-OCR backend simply hits this RunPod endpoint.
 
 ## Features
 
-- **97% Table TEDS Accuracy**: Best-in-class table structure recognition
-- **IBM Production Approach**: Uses official Docling SDK with VlmPipeline
-- **GPU Accelerated**: CUDA support for fast inference
-- **RunPod Serverless**: Auto-scaling with webhook deployment
+- **97% Table TEDS Accuracy**: Granite-Docling VLM tuned for financial docs
+- **Direct vLLM Inference**: Mirrors Docling’s inline VLM implementation (untied weights, transformers backend, eager mode)
+- **docling-core Rendering**: Converts DocTags to Markdown and structured tables on-GPU
+- **RunPod Serverless**: Auto-scaling GPU endpoint with webhook-driven deploys
 
 ## Model Specs
 
@@ -49,7 +53,7 @@ Production-quality document understanding using IBM's Granite-Docling-258M with 
     ],
     "metadata": {
       "model": "granite-docling-258M",
-      "pipeline": "VlmPipeline",
+      "pipeline": "direct-vllm",
       "inference_time_seconds": 5.2,
       "total_time_seconds": 6.1,
       "table_count": 3,
@@ -62,13 +66,17 @@ Production-quality document understanding using IBM's Granite-Docling-258M with 
 ## Architecture
 
 ```
-PDF → Docling SDK → VlmPipeline → Granite-Docling-258M → DocTags → Markdown/Tables
+PDF (base64) → handler.py
+  ↳ pdf2image (144 DPI RGB)
+  ↳ batched vLLM (ibm-granite/granite-docling-258M, transformers backend, enforce_eager)
+  ↳ docling-core (DocTagsDocument + DoclingDocument)
+  ↳ Markdown + tables + text content
 ```
 
-This uses the IBM-recommended production approach:
-1. **Docling SDK**: Official document processing library
-2. **VlmPipeline**: Vision-Language Model pipeline for 97% accuracy
-3. **Granite-Docling-258M**: Compact 258M parameter VLM optimized for documents
+Key runtime settings (see `handler.py`):
+1. `model_impl="transformers"` and `revision="untied"` – required by IBM for Granite-Docling.
+2. `enforce_eager=True` – avoids CUDA graph warmups (>10 min) on serverless cold starts.
+3. `limit_mm_per_prompt={"image": 1}` and `enable_prefix_caching=False` – ensure multimodal stability.
 
 ## Deployment
 

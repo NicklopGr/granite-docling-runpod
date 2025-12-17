@@ -1,8 +1,10 @@
 # Granite-Docling-258M RunPod Dependencies
-# Uses IBM Docling SDK with VlmPipeline (production approach)
+# v37: Pin docling-core to 2.55.0 (latest as of Dec 2025)
+# This ensures consistent DocTags parsing across builds
 
-# Docling with VLM support
-docling[vlm]
+# Core docling-core for DocTags -> Markdown conversion
+# v37: Pin version for consistency with FIN-OCR docling container
+docling-core==2.55.0
 
 # Image processing
 pillow
