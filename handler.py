@@ -206,10 +206,11 @@ def parse_all_doctags_with_docling_core(all_doctags: List[str], all_images: List
                         "row_count": row_count
                     })
                     logger.info(f"[GraniteDocling] Table {i+1}: {row_count} rows")
+                    if row_count == 0 or not table_md.strip():
+                        logger.warning(f"[GraniteDocling] v38: Table {i+1} markdown empty after export (possible continuation page)")
 
                 except Exception as table_error:
-                    logger.error(f"[GraniteDocling] v38: FAILED processing table {i+1}: {table_error}")
-                    logger.error(f"[GraniteDocling] v38: Table {i+1} error traceback: {traceback.format_exc()}")
+                    logger.exception(f"[GraniteDocling] v38: FAILED processing table {i+1}: {table_error}")
                     # Add empty table to maintain count
                     tables.append({
                         "table_number": i + 1,
