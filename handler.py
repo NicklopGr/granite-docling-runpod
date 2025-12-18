@@ -6,10 +6,10 @@ Uses docling-core for proper DocTags -> Markdown conversion.
 
 Key Features:
 - Direct vLLM.LLM() client with untied weights
-- PDF rendered to RGB using pdf2image at 192 DPI (no RGBA conversion)
-- docling-core for DocTags parsing (DocTagsDocument + DoclingDocument)
-- Max 10 pages per vLLM batch (memory optimization)
-- v38: Page-by-page docling-core parsing for stability
+- 240 DPI PDF rendering streamed to /tmp (no long-lived PIL objects)
+- docling-core multi-page parsing (DocTagsDocument + DoclingDocument) for cross-page tables
+- Single-page vLLM batches (matches transformers.js demo) to keep prompts deterministic
+- v39: Restored continuation heuristics + page-specific markdown slices
 
 API Input: {"input": {"pdf_base64": "base64_encoded_pdf"}}
 API Output: {"status": "success", "result": {"markdown": "...", "tables": [...], "text_content": [...]}}
@@ -18,7 +18,7 @@ Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
 - IBM recommendation: Direct vLLM for production (not Docling SDK)
 
-Build: 2025-12-17-v38-debug-tables
+Build: 2025-12-18-v39-streaming-multipage
 """
 
 import runpod
@@ -29,7 +29,9 @@ import traceback
 import json
 import logging
 import re
-from typing import List, Dict, Any
+import shutil
+import tempfile
+from typing import List, Dict, Any, Tuple
 from PIL import Image
 import torch
 
@@ -112,170 +114,179 @@ def load_vllm():
     return llm, processor
 
 
-def render_pdf_to_rgb(pdf_bytes: bytes) -> List[Image.Image]:
+def render_pdf_to_disk(pdf_bytes: bytes) -> Tuple[List[str], str]:
     """
-    Render PDF pages directly to RGB (no RGBA conversion needed).
+    Render PDF pages to temporary PNG files and return their paths.
 
-    Uses pdf2image with PPM format which produces RGB by default.
+    Storing the images on disk lets us stream them into vLLM/docling-core without
+    keeping dozens of PIL objects resident in GPU worker RAM.
     """
     from pdf2image import convert_from_bytes
 
-    logger.info("[GraniteDocling] Rendering PDF to RGB images...")
+    scratch_dir = tempfile.mkdtemp(prefix="granite_pages_")
+    logger.info(f"[GraniteDocling] Rendering PDF to {scratch_dir} at 240 DPI...")
     start_time = time.time()
 
-    # Convert PDF to images
-    # Increase to 240 DPI for sharper tables (helps Granite detect gridlines)
-    images = convert_from_bytes(
+    image_paths = convert_from_bytes(
         pdf_bytes,
         dpi=240,
-        fmt='ppm'  # PPM format = RGB by default (no alpha channel)
+        fmt="png",
+        output_folder=scratch_dir,
+        paths_only=True,
     )
 
-    # Convert to RGB explicitly (in case any format creates RGBA)
-    rgb_images = []
-    for i, img in enumerate(images):
-        if img.mode != 'RGB':
-            logger.warning(f"[GraniteDocling] Page {i+1}: Converting {img.mode} to RGB")
-            img = img.convert('RGB')
-        else:
-            logger.info(f"[GraniteDocling] Page {i+1}: Already RGB mode")
-
-        logger.info(f"[GraniteDocling] Page {i+1}: Size {img.size}")
-        rgb_images.append(img)
-
+    # pdf2image preserves page order, but sort defensively.
+    image_paths = sorted(image_paths)
     elapsed = time.time() - start_time
-    logger.info(f"[GraniteDocling] Rendered {len(rgb_images)} pages in {elapsed:.2f}s")
+    logger.info(f"[GraniteDocling] Rendered {len(image_paths)} pages in {elapsed:.2f}s")
 
-    return rgb_images
+    return image_paths, scratch_dir
 
 
-def parse_page_with_docling_core(
-    doctags_text: str,
-    image: Image.Image,
-    page_number: int
+def load_image_as_rgb(image_path: str) -> Image.Image:
+    """Load an image file as RGB, returning a new PIL object the caller must close."""
+    with Image.open(image_path) as img:
+        if img.mode != "RGB":
+            return img.convert("RGB")
+        return img.copy()
+
+
+def split_markdown_into_pages(markdown: str, total_pages: int) -> List[str]:
+    """
+    Split combined markdown into per-page segments using Docling's
+    "--- Page N ---" delimiters. Pads/truncates to total_pages entries.
+    """
+    if not markdown:
+        return ["" for _ in range(total_pages)]
+
+    pattern = re.compile(r"\n+--- Page (\d+) ---\n+")
+    sections: List[str] = []
+    last_idx = 0
+
+    for match in pattern.finditer(markdown):
+        sections.append(markdown[last_idx:match.start()].strip())
+        last_idx = match.end()
+
+    sections.append(markdown[last_idx:].strip())
+
+    if len(sections) < total_pages:
+        sections.extend([""] * (total_pages - len(sections)))
+    elif len(sections) > total_pages:
+        sections = sections[:total_pages]
+
+    return sections
+
+
+def parse_document_with_docling_core(
+    doctags_list: List[str],
+    image_paths: List[str]
 ) -> Dict[str, Any]:
     """
-    Parse a single page of DocTags using docling-core.
-    This mirrors the transformers.js demo (one image at a time) and avoids
-    the current limitations docling-core has with multi-page continuation tables.
+    Parse ALL DocTags at once using docling-core so continuation tables retain context.
     """
     from docling_core.types.doc import DoclingDocument
     from docling_core.types.doc.document import DocTagsDocument
 
-    logger.info(f"[GraniteDocling] v38: Parsing page {page_number} with docling-core")
+    logger.info(
+        f"[GraniteDocling] Multi-page docling-core parse starting "
+        f"(pages={len(doctags_list)})"
+    )
 
+    images: List[Image.Image] = []
     try:
-        doctags_doc = DocTagsDocument.from_doctags_and_image_pairs([doctags_text], [image])
+        for path in image_paths:
+            images.append(load_image_as_rgb(path))
+
+        doctags_doc = DocTagsDocument.from_doctags_and_image_pairs(
+            doctags_list,
+            images,
+        )
         doc = DoclingDocument.load_from_doctags(
             doctags_doc,
-            document_name=f"Page {page_number}"
+            document_name="GraniteDoclingDocument",
         )
 
-        markdown = doc.export_to_markdown()
+        full_markdown = doc.export_to_markdown()
+        page_markdowns = split_markdown_into_pages(
+            full_markdown,
+            total_pages=len(image_paths),
+        )
+
         tables = []
-        text_content = []
-
-        if hasattr(doc, 'tables') and doc.tables:
-            logger.info(f"[GraniteDocling] v38: Found {len(doc.tables)} tables on page {page_number}")
-            for i, table in enumerate(doc.tables):
+        if hasattr(doc, "tables") and doc.tables:
+            logger.info(f"[GraniteDocling] docling-core surfaced {len(doc.tables)} tables")
+            for idx, table in enumerate(doc.tables):
                 try:
-                    logger.info(f"[GraniteDocling] v38: Processing table {i + 1}/{len(doc.tables)} on page {page_number}")
-
                     table_md = ""
-                    if hasattr(table, 'export_to_markdown'):
+                    if hasattr(table, "export_to_markdown"):
                         try:
                             table_md = table.export_to_markdown(doc=doc)
-                        except TypeError as te:
-                            logger.warning(f"[GraniteDocling] v38: Table {i+1} export_to_markdown(doc=doc) failed on page {page_number}: {te}")
+                        except TypeError:
                             table_md = table.export_to_markdown()
                     else:
                         table_md = str(table)
 
-                    row_count = len(table_md.strip().split('\n')) - 1 if table_md else 0
-                    tables.append({
-                        "table_number": i + 1,
-                        "markdown": table_md,
-                        "row_count": row_count,
-                        "page_number": page_number
-                    })
-                    logger.info(f"[GraniteDocling] Table {i+1} on page {page_number}: {row_count} rows")
-                    if row_count == 0 or not table_md.strip():
-                        logger.warning(f"[GraniteDocling] v38: Table {i+1} markdown empty on page {page_number} (likely continuation)")
+                    row_count = (
+                        len(table_md.strip().split("\n")) - 1 if table_md.strip() else 0
+                    )
+                    page_number = None
+                    if getattr(table, "prov", None):
+                        prov = table.prov[0]
+                        page_number = (prov.page_no or 0) + 1
 
+                    tables.append(
+                        {
+                            "table_number": idx + 1,
+                            "markdown": table_md,
+                            "row_count": max(row_count, 0),
+                            "page_number": page_number,
+                        }
+                    )
                 except Exception as table_error:
-                    logger.exception(f"[GraniteDocling] v38: FAILED processing table {i+1} on page {page_number}: {table_error}")
-                    tables.append({
-                        "table_number": i + 1,
-                        "markdown": "",
-                        "row_count": 0,
-                        "page_number": page_number,
-                        "error": str(table_error)
-                    })
+                    logger.exception(
+                        f"[GraniteDocling] FAILED exporting table {idx + 1}: {table_error}"
+                    )
+                    tables.append(
+                        {
+                            "table_number": idx + 1,
+                            "markdown": "",
+                            "row_count": 0,
+                            "page_number": None,
+                            "error": str(table_error),
+                        }
+                    )
 
-        if hasattr(doc, 'texts') and doc.texts:
+        text_content = []
+        if hasattr(doc, "texts") and doc.texts:
             for text in doc.texts:
-                text_content.append({
-                    "text": str(text),
-                    "type": "text",
-                    "page_number": page_number
-                })
-
-        logger.info(f"[GraniteDocling] Page {page_number}: docling-core parsed {len(tables)} tables, {len(text_content)} text items")
-        logger.info(f"[GraniteDocling] Page {page_number}: Markdown length {len(markdown)} chars")
+                page_number = None
+                if getattr(text, "prov", None):
+                    page_number = (text.prov[0].page_no or 0) + 1
+                text_content.append(
+                    {
+                        "text": str(text),
+                        "type": "text",
+                        "page_number": page_number,
+                    }
+                )
 
         return {
             "tables": tables,
             "text_content": text_content,
-            "markdown": markdown,
-            "raw_doctags": doctags_text,
-            "page_number": page_number
+            "markdown": full_markdown,
+            "page_markdowns": page_markdowns,
+            "raw_doctags": doctags_list,
         }
 
     except Exception as e:
-        logger.exception(f"[GraniteDocling] docling-core parsing failed on page {page_number}: {e}")
-        return {
-            "tables": [],
-            "text_content": [{"text": doctags_text, "type": "raw_doctags", "page_number": page_number}],
-            "markdown": doctags_text,
-            "raw_doctags": doctags_text,
-            "page_number": page_number,
-            "error": str(e)
-        }
-
-
-def combine_pages(page_results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Combine results from multiple pages into single result."""
-    all_tables = []
-    all_text = []
-    full_markdown = []
-
-    table_counter = 0
-    for page_num, page_result in enumerate(page_results):
-        # Add page separator in markdown
-        if page_num > 0:
-            full_markdown.append(f"\n\n--- Page {page_num + 1} ---\n\n")
-
-        # Add the page's markdown (from docling-core)
-        page_markdown = page_result.get("markdown", "")
-        if page_markdown:
-            full_markdown.append(page_markdown)
-
-        # Renumber tables globally
-        for table in page_result.get("tables", []):
-            table_counter += 1
-            table["table_number"] = table_counter
-            all_tables.append(table)
-
-        # Add text content
-        for text_item in page_result.get("text_content", []):
-            all_text.append(text_item)
-
-    return {
-        "tables": all_tables,
-        "text_content": all_text,
-        "markdown": '\n\n'.join(full_markdown),
-        "raw_doctags": [p.get("raw_doctags", "") for p in page_results]
-    }
+        logger.exception("[GraniteDocling] docling-core multi-page parsing failed: %s", e)
+        raise
+    finally:
+        for img in images:
+            try:
+                img.close()
+            except Exception:
+                pass
 
 
 def process_pdf(pdf_base64: str) -> Dict[str, Any]:
@@ -284,13 +295,13 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
 
     Steps:
     1. Decode PDF bytes
-    2. Render to RGB images (144 DPI, PPM format)
-    3. Process ALL pages in batched llm.generate() calls
-    4. v37: Collect ALL DocTags, then parse with docling-core ONCE (multi-page mode)
-    5. Return combined result
+    2. Render images to disk at 240 DPI (streamed RGB PNGs)
+    3. Process ALL pages via single-page llm.generate() calls
+    4. Collect ALL DocTags, then parse with docling-core ONCE (multi-page mode)
+    5. Return combined result with per-page markdown slices
 
     v31: Switched from sequential to batch processing.
-    v37: Parse all pages at once with docling-core for cross-page table context.
+    v39: Parse all pages at once with docling-core for cross-page table context.
     See: https://github.com/docling-project/docling/blob/main/docling/models/vlm_models_inline/vllm_model.py
     """
     from vllm import SamplingParams
@@ -303,8 +314,8 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
     pdf_bytes = base64.b64decode(pdf_base64)
     logger.info(f"[GraniteDocling] PDF size: {len(pdf_bytes)} bytes")
 
-    # Render to RGB
-    rgb_images = render_pdf_to_rgb(pdf_bytes)
+    # Render to disk
+    image_paths, scratch_dir = render_pdf_to_disk(pdf_bytes)
 
     # IBM's official message format for granite-docling
     messages = [
@@ -330,69 +341,109 @@ def process_pdf(pdf_base64: str) -> Dict[str, Any]:
     # Force single-page batches (matches transformers.js demo) to avoid continuation loss
     MAX_PAGES_PER_BATCH = 1
 
-    logger.info(f"[GraniteDocling] Processing {len(rgb_images)} pages (max {MAX_PAGES_PER_BATCH} per batch)...")
+    total_pages = len(image_paths)
+    logger.info(
+        f"[GraniteDocling] Processing {total_pages} pages "
+        f"(max {MAX_PAGES_PER_BATCH} per batch)..."
+    )
     inference_start = time.time()
 
     prompt = proc.apply_chat_template(messages, add_generation_prompt=True)
     logger.info(f"[GraniteDocling] Using prompt format: {prompt[:200]}...")
 
-    # Collect all doctags/images first, then parse page-by-page
-    all_doctags = []
-    all_images_for_parsing = []
-    total_pages = len(rgb_images)
+    # Collect all doctags for multi-page parsing
+    all_doctags: List[str] = []
 
-    # Process pages in chunks of MAX_PAGES_PER_BATCH (vLLM inference)
-    for batch_start in range(0, total_pages, MAX_PAGES_PER_BATCH):
-        batch_end = min(batch_start + MAX_PAGES_PER_BATCH, total_pages)
-        batch_images = rgb_images[batch_start:batch_end]
-        batch_num = (batch_start // MAX_PAGES_PER_BATCH) + 1
-        total_batches = (total_pages + MAX_PAGES_PER_BATCH - 1) // MAX_PAGES_PER_BATCH
+    try:
+        # Process pages in chunks of MAX_PAGES_PER_BATCH (vLLM inference)
+        for batch_start in range(0, total_pages, MAX_PAGES_PER_BATCH):
+            batch_end = min(batch_start + MAX_PAGES_PER_BATCH, total_pages)
+            batch_paths = image_paths[batch_start:batch_end]
+            batch_num = (batch_start // MAX_PAGES_PER_BATCH) + 1
+            total_batches = (total_pages + MAX_PAGES_PER_BATCH - 1) // MAX_PAGES_PER_BATCH
 
-        logger.info(f"[GraniteDocling] Batch {batch_num}/{total_batches}: Pages {batch_start+1}-{batch_end}")
+            logger.info(
+                f"[GraniteDocling] Batch {batch_num}/{total_batches}: "
+                f"Pages {batch_start + 1}-{batch_end}"
+            )
 
-        # Build batch inputs for this chunk
-        batched_inputs = []
-        for i, image in enumerate(batch_images):
-            batched_inputs.append({
-                "prompt": prompt,
-                "multi_modal_data": {"image": image}
-            })
-            logger.info(f"[GraniteDocling] Added page {batch_start + i + 1} to batch")
+            # Build batch inputs for this chunk
+            batched_inputs = []
+            opened_images: List[Image.Image] = []
+            for i, image_path in enumerate(batch_paths):
+                image = load_image_as_rgb(image_path)
+                opened_images.append(image)
+                batched_inputs.append(
+                    {
+                        "prompt": prompt,
+                        "multi_modal_data": {"image": image},
+                    }
+                )
+                logger.info(f"[GraniteDocling] Added page {batch_start + i + 1} to batch")
 
-        # Single generate call for this batch
-        logger.info(f"[GraniteDocling] Running batch inference for {len(batched_inputs)} pages...")
-        outputs = llm_client.generate(batched_inputs, sampling_params=sampling_params)
+            # Single generate call for this batch
+            logger.info(
+                f"[GraniteDocling] Running batch inference for {len(batched_inputs)} pages..."
+            )
+            outputs = llm_client.generate(
+                batched_inputs,
+                sampling_params=sampling_params,
+            )
 
-        # v37: Collect outputs instead of parsing immediately
-        for i, output in enumerate(outputs):
-            page_num = batch_start + i + 1
-            doctags = output.outputs[0].text
+            # Close PIL images immediately after inference
+            for img in opened_images:
+                try:
+                    img.close()
+                except Exception:
+                    pass
 
-            logger.info(f"[GraniteDocling] Page {page_num}: {len(doctags)} chars")
-            # DEBUG: Log first 500 chars of raw output to see actual format
-            logger.info(f"[GraniteDocling] Page {page_num} raw output (first 500 chars): {doctags[:500]}")
-            # DEBUG: Log last 200 chars to check if output is truncated
-            logger.info(f"[GraniteDocling] Page {page_num} raw output (last 200 chars): {doctags[-200:]}")
+            # Collect outputs for downstream parsing
+            for i, output in enumerate(outputs):
+                page_num = batch_start + i + 1
+                doctags = output.outputs[0].text or ""
 
-            # v37: Collect for batch parsing
-            all_doctags.append(doctags)
-            all_images_for_parsing.append(batch_images[i])
+                logger.info(f"[GraniteDocling] Page {page_num}: {len(doctags)} chars")
+                logger.info(
+                    f"[GraniteDocling] Page {page_num} raw output (first 500 chars): "
+                    f"{doctags[:500]}"
+                )
+                logger.info(
+                    f"[GraniteDocling] Page {page_num} raw output (last 200 chars): "
+                    f"{doctags[-200:]}"
+                )
 
-    inference_time = time.time() - inference_start
-    logger.info(f"[GraniteDocling] vLLM inference completed in {inference_time:.2f}s ({inference_time/len(rgb_images):.2f}s per page)")
+                all_doctags.append(doctags)
 
-    # Parse each page independently (matches transformers.js demo behavior)
-    logger.info(f"[GraniteDocling] v38: Parsing {len(all_doctags)} pages individually with docling-core...")
-    parse_start = time.time()
-    page_results = []
-    for page_idx, (doctags, image) in enumerate(zip(all_doctags, all_images_for_parsing), start=1):
-        page_results.append(parse_page_with_docling_core(doctags, image, page_idx))
+        inference_time = time.time() - inference_start
+        per_page_time = inference_time / total_pages if total_pages else 0
+        logger.info(
+            f"[GraniteDocling] vLLM inference completed in {inference_time:.2f}s "
+            f"({per_page_time:.2f}s per page)"
+        )
 
-    parse_time = time.time() - parse_start
-    logger.info(f"[GraniteDocling] docling-core page-by-page parsing completed in {parse_time:.2f}s")
+        if len(all_doctags) != total_pages:
+            logger.warning(
+                "[GraniteDocling] Page count mismatch (doctags=%s, pages=%s). "
+                "Padding with empty DocTags.",
+                len(all_doctags),
+                total_pages,
+            )
+            while len(all_doctags) < total_pages:
+                all_doctags.append("")
 
-    combined = combine_pages(page_results)
-    return combined, inference_time, len(rgb_images)
+        logger.info(
+            f"[GraniteDocling] docling-core multi-page parse kicking off "
+            f"(pages={len(all_doctags)})"
+        )
+        parse_start = time.time()
+        combined = parse_document_with_docling_core(all_doctags, image_paths)
+        parse_time = time.time() - parse_start
+        logger.info(f"[GraniteDocling] docling-core parsing completed in {parse_time:.2f}s")
+
+        return combined, inference_time, total_pages
+
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
 
 
 def handler(event):
@@ -424,6 +475,7 @@ def handler(event):
             "status": "success",
             "result": {
                 "markdown": result["markdown"],
+                "page_markdowns": result.get("page_markdowns", []),
                 "tables": result["tables"],
                 "text_content": result["text_content"],
                 "raw_doctags": result.get("raw_doctags", []),

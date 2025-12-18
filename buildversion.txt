@@ -1,1 +1,1 @@
-2025-12-16-v30-docling-core-parsing
+2025-12-18-v39-streaming-multipage

@@ -2,15 +2,15 @@
 
 Production-grade Granite-Docling-258M serving that mirrors IBM’s recommended direct **vLLM** deployment:
 
-- PDFs are rendered at 144 DPI, batched (up to 10 pages), and fed directly into `vllm.LLM`.
-- `docling-core` converts the generated DocTags into Markdown/tables so downstream services can stay unchanged.
+- PDFs are rendered at 240 DPI, streamed to `/tmp`, and fed page-by-page into `vllm.LLM`.
+- `docling-core` ingests the complete set of DocTags + page images to rebuild continuation tables with cross-page heuristics.
 - No Docling SDK server is embedded here—the FIN-OCR backend simply hits this RunPod endpoint.
 
 ## Features
 
 - **97% Table TEDS Accuracy**: Granite-Docling VLM tuned for financial docs
 - **Direct vLLM Inference**: Mirrors Docling’s inline VLM implementation (untied weights, transformers backend, eager mode)
-- **docling-core Rendering**: Converts DocTags to Markdown and structured tables on-GPU
+- **docling-core Rendering**: Converts DocTags to Markdown, page slices, and structured tables on-GPU
 - **RunPod Serverless**: Auto-scaling GPU endpoint with webhook-driven deploys
 
 ## Model Specs
@@ -40,6 +40,9 @@ Production-grade Granite-Docling-258M serving that mirrors IBM’s recommended d
   "status": "success",
   "result": {
     "markdown": "# Document Title\n\n| Col1 | Col2 |\n|---|---|\n| A | B |",
+    "page_markdowns": [
+      "# Document Title\n\n| Col1 | Col2 |\n|---|---|\n| A | B |"
+    ],
     "tables": [
       {
         "table_number": 1,
@@ -67,16 +70,17 @@ Production-grade Granite-Docling-258M serving that mirrors IBM’s recommended d
 
 ```
 PDF (base64) → handler.py
-  ↳ pdf2image (144 DPI RGB)
-  ↳ batched vLLM (ibm-granite/granite-docling-258M, transformers backend, enforce_eager)
-  ↳ docling-core (DocTagsDocument + DoclingDocument)
-  ↳ Markdown + tables + text content
+  ↳ pdf2image (240 DPI RGB written to /tmp)
+  ↳ vLLM single-page batches (ibm-granite/granite-docling-258M, transformers backend, enforce_eager)
+  ↳ docling-core multi-page parse (DocTagsDocument + DoclingDocument)
+  ↳ Markdown + per-page markdown + tables + text content
 ```
 
 Key runtime settings (see `handler.py`):
 1. `model_impl="transformers"` and `revision="untied"` – required by IBM for Granite-Docling.
 2. `enforce_eager=True` – avoids CUDA graph warmups (>10 min) on serverless cold starts.
 3. `limit_mm_per_prompt={"image": 1}` and `enable_prefix_caching=False` – ensure multimodal stability.
+4. Streaming 240 DPI PNGs to `/tmp` prevents 20+ GB spikes when processing 30+ page statements.
 
 ## Deployment
 
