@@ -97,8 +97,9 @@ def load_vllm():
             enforce_eager=True,  # CRITICAL - disable CUDA graphs (matches Docling)
             limit_mm_per_prompt={"image": 4},  # Allow multiple images prompt context
             trust_remote_code=True,
-            enable_prefix_caching=False  # Prevent cache reuse across different PDFs
-            # Let vLLM auto-detect: dtype, gpu_memory_utilization (0.9), max_model_len
+            enable_prefix_caching=False,  # Prevent cache reuse across different PDFs
+            gpu_memory_utilization=0.6  # RunPod RTX 4090s need smaller KV cache reservation
+            # Let vLLM auto-detect: dtype, max_model_len
         )
 
         # Load processor for prompt formatting
