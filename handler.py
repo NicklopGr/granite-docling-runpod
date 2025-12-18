@@ -46,6 +46,7 @@ Follow this schema exactly:
    - Output a single <otsl> enclosing the table coordinates.
    - Produce header rows with <ched>.
    - Produce every table cell with <fcel> ... </fcel> in strict row-major order.
+   - Keep textual descriptions inside the Description column. Do NOT move description text into the debit/credit cells; numeric values must stay under the debit/credit headers.
    - Each <fcel> must contain the textual value for that cell. Never leave a cell empty and never omit debit/credit columns.
    - Continuation pages must restate all columns (date, description, debit, credit, balance) exactly like the first page.
 4. If a source cell is blank, still emit <fcel></fcel> so downstream parsers know it was intentionally empty.
@@ -425,6 +426,7 @@ def handler(event):
                 "markdown": result["markdown"],
                 "tables": result["tables"],
                 "text_content": result["text_content"],
+                "raw_doctags": result.get("raw_doctags", []),
                 "metadata": {
                     "model": "granite-docling-258M",
                     "pipeline": "direct-vllm",
