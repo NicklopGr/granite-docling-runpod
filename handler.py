@@ -95,7 +95,7 @@ def load_vllm():
             revision="untied",  # CRITICAL - untied weights required
             model_impl="transformers",  # CRITICAL - use Transformers backend for Idefics3
             enforce_eager=True,  # CRITICAL - disable CUDA graphs (matches Docling)
-            limit_mm_per_prompt={"image": 4},  # Allow multiple images prompt context
+            limit_mm_per_prompt={"image": 1},  # Single page per prompt (Docling default)
             trust_remote_code=True,
             enable_prefix_caching=False,  # Prevent cache reuse across different PDFs
             gpu_memory_utilization=0.6  # RunPod RTX 4090s need smaller KV cache reservation
