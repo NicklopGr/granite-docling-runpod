@@ -1,24 +1,23 @@
 """
-Granite-Docling-258M RunPod Serverless Handler (Direct vLLM Inference)
+Granite-Docling-258M RunPod Serverless Handler (Direct Transformers Inference)
 
-Uses direct vLLM API following IBM's recommended production approach.
-Uses docling-core for proper DocTags -> Markdown conversion.
+Runs IBM's Granite-Docling model via HuggingFace transformers (matching Docling's inline VLM pipeline)
+and uses docling-core for DocTags -> Markdown conversion.
 
 Key Features:
-- Direct vLLM.LLM() client with untied weights
+- Transformers-based Granite inference with untied weights (no vLLM dependency)
 - 240 DPI PDF rendering streamed to /tmp (no long-lived PIL objects)
 - docling-core multi-page parsing (DocTagsDocument + DoclingDocument) for cross-page tables
-- Single-page vLLM batches (matches transformers.js demo) to keep prompts deterministic
-- v39: Restored continuation heuristics + page-specific markdown slices
+- Deterministic prompts/page-by-page generation with per-page markdown slices
 
 API Input: {"input": {"pdf_base64": "base64_encoded_pdf"}}
-API Output: {"status": "success", "result": {"markdown": "...", "tables": [...], "text_content": [...]}}
+API Output: {"status": "success", "result": {"markdown": "...", "tables": [...], "text_content": [...]} }
 
 Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
-- IBM recommendation: Direct vLLM for production (not Docling SDK)
+- Docling inline Granite pipeline: https://docling-project.github.io/docling/
 
-Build: 2025-12-18-v39-streaming-multipage
+Build: 2025-12-19-v40-transformers
 """
 
 import runpod
@@ -31,9 +30,11 @@ import logging
 import re
 import shutil
 import tempfile
+import contextlib
 from typing import List, Dict, Any, Tuple
 from PIL import Image
 import torch
+from transformers import AutoModelForVision2Seq, AutoProcessor
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -61,65 +62,140 @@ Convert the provided page image into precise DocTags with complete table markup.
 torch.set_float32_matmul_precision('high')
 logger.info("[GraniteDocling] TF32 tensor cores enabled (float32_matmul_precision='high')")
 
-# Global vLLM client - loaded once, reused across requests
-llm = None
+# Granite model + processor globals
+MODEL_NAME = "ibm-granite/granite-docling-258M"
+MODEL_REVISION = "untied"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _select_model_dtype() -> torch.dtype:
+    if device.type == "cuda":
+        if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float16
+    return torch.float32
+
+
+MODEL_DTYPE = _select_model_dtype()
+model = None
 processor = None
 
 
-def load_vllm():
-    """Load vLLM with Granite-Docling-258M (untied weights)."""
-    global llm, processor
+def load_transformer_model():
+    """Load Granite-Docling through transformers (Docling inline pipeline)."""
+    global model, processor
 
-    if llm is None:
-        from vllm import LLM, SamplingParams
-        from transformers import AutoProcessor
-
-        logger.info("[GraniteDocling] Loading vLLM with direct inference...")
-        logger.info("[GraniteDocling] Model: ibm-granite/granite-docling-258M (untied)")
-
-        start_time = time.time()
-
-        # Load vLLM model with Docling-aligned settings
-        # v34: Use vLLM defaults for dtype, gpu_memory_utilization, max_model_len
-        #      Only set parameters that Docling explicitly requires:
-        #      - model_impl="transformers": Forces HuggingFace backend for Idefics3
-        #      - limit_mm_per_prompt: Required for multimodal models
-        #      - enable_prefix_caching=False: Prevents KV cache reuse across different images
-        #      See: https://github.com/docling-project/docling/blob/main/docling/models/vlm_models_inline/vllm_model.py
-        # v36: Add enforce_eager=True to disable CUDA graph compilation
-        # Docling's vllm_model.py uses this exact configuration - without it,
-        # Transformers backend triggers 10+ minute CUDA graph compilation
-        # See: https://github.com/docling-project/docling/blob/main/docling/models/vlm_models_inline/vllm_model.py
-        llm = LLM(
-            model="ibm-granite/granite-docling-258M",
-            revision="untied",  # CRITICAL - untied weights required
-            model_impl="transformers",  # CRITICAL - use Transformers backend for Idefics3
-            enforce_eager=True,  # CRITICAL - disable CUDA graphs (matches Docling)
-            limit_mm_per_prompt={"image": 1},  # Single page per prompt (Docling default)
-            trust_remote_code=True,
-            enable_prefix_caching=False,  # Prevent cache reuse across different PDFs
-            gpu_memory_utilization=0.6  # RunPod RTX 4090s need smaller KV cache reservation
-            # Let vLLM auto-detect: dtype, max_model_len
-        )
-
-        # Load processor for prompt formatting
+    if processor is None:
         processor = AutoProcessor.from_pretrained(
-            "ibm-granite/granite-docling-258M",
-            revision="untied",
+            MODEL_NAME,
+            revision=MODEL_REVISION,
             trust_remote_code=True
         )
 
-        elapsed = time.time() - start_time
-        logger.info(f"[GraniteDocling] vLLM loaded in {elapsed:.2f}s")
+    if model is None:
+        logger.info(
+            "[GraniteDocling] Loading transformers model on %s (dtype=%s)...",
+            device,
+            MODEL_DTYPE,
+        )
+        dtype_arg = MODEL_DTYPE if device.type == "cuda" else torch.float32
+        model = AutoModelForVision2Seq.from_pretrained(
+            MODEL_NAME,
+            revision=MODEL_REVISION,
+            trust_remote_code=True,
+            torch_dtype=dtype_arg,
+        )
+        model.to(device)
+        model.eval()
+        logger.info("[GraniteDocling] Model loaded successfully.")
 
-    return llm, processor
+    return model, processor
+
+
+@contextlib.contextmanager
+def autocast_if_available():
+    """Enable CUDA autocast for transformer inference if a GPU is present."""
+    if device.type == "cuda":
+        with torch.autocast(device_type="cuda", dtype=MODEL_DTYPE):
+            yield
+    else:
+        yield
+
+
+def generate_doctags_for_image(image: Image.Image, page_number: int) -> str:
+    """Run Granite-Docling (transformers) on a single page image to obtain DocTags."""
+    model, proc = load_transformer_model()
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": DOC_TAG_PROMPT},
+            ],
+        }
+    ]
+    prompt = proc.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+
+    inputs = proc(
+        text=prompt,
+        images=image,
+        return_tensors="pt",
+    )
+    inputs = {
+        k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+        for k, v in inputs.items()
+    }
+
+    input_len = inputs["input_ids"].shape[-1]
+    pad_token_id = proc.tokenizer.pad_token_id or proc.tokenizer.eos_token_id
+    eos_token_id = proc.tokenizer.eos_token_id
+
+    generation_kwargs = dict(
+        max_new_tokens=2048,
+        temperature=0.0,
+        do_sample=False,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        use_cache=True,
+    )
+
+    start = time.time()
+    with torch.inference_mode():
+        if device.type == "cuda":
+            with autocast_if_available():
+                output_ids = model.generate(**inputs, **generation_kwargs)
+        else:
+            output_ids = model.generate(**inputs, **generation_kwargs)
+    elapsed = time.time() - start
+
+    generated_ids = output_ids[:, input_len:]
+    doctags_text = proc.batch_decode(
+        generated_ids,
+        skip_special_tokens=False,
+    )[0].strip()
+
+    if "</doctag>" not in doctags_text:
+        doctags_text += "</doctag>"
+
+    logger.info(
+        "[GraniteDocling] Page %d: generated %d chars in %.2fs",
+        page_number,
+        len(doctags_text),
+        elapsed,
+    )
+    return doctags_text
 
 
 def render_pdf_to_disk(pdf_bytes: bytes) -> Tuple[List[str], str]:
     """
     Render PDF pages to temporary PNG files and return their paths.
 
-    Storing the images on disk lets us stream them into vLLM/docling-core without
+    Storing the images on disk lets us stream them into the Granite transformer/docling-core without
     keeping dozens of PIL objects resident in GPU worker RAM.
     """
     from pdf2image import convert_from_bytes
@@ -292,164 +368,47 @@ def parse_document_with_docling_core(
 
 def process_pdf(pdf_base64: str) -> Dict[str, Any]:
     """
-    Process PDF with direct vLLM inference using BATCH processing.
-
-    Steps:
-    1. Decode PDF bytes
-    2. Render images to disk at 240 DPI (streamed RGB PNGs)
-    3. Process ALL pages via single-page llm.generate() calls
-    4. Collect ALL DocTags, then parse with docling-core ONCE (multi-page mode)
-    5. Return combined result with per-page markdown slices
-
-    v31: Switched from sequential to batch processing.
-    v39: Parse all pages at once with docling-core for cross-page table context.
-    See: https://github.com/docling-project/docling/blob/main/docling/models/vlm_models_inline/vllm_model.py
+    Process a PDF by streaming pages through the Granite-Docling transformers model
+    and then parsing the combined DocTags with docling-core.
     """
-    from vllm import SamplingParams
-
-    # Load vLLM client
-    llm_client, proc = load_vllm()
-
-    # Decode PDF
-    logger.info("[GraniteDocling] Decoding PDF...")
+    logger.info("[GraniteDocling] Decoding PDF payload...")
     pdf_bytes = base64.b64decode(pdf_base64)
     logger.info(f"[GraniteDocling] PDF size: {len(pdf_bytes)} bytes")
 
-    # Render to disk
     image_paths, scratch_dir = render_pdf_to_disk(pdf_bytes)
-
-    # IBM's official message format for granite-docling
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": DOC_TAG_PROMPT}
-            ],
-        },
-    ]
-
-    # Configure sampling
-    # v33: Added stop strings from Docling's vlm_model_specs.py
-    sampling_params = SamplingParams(
-        temperature=0.0,  # Deterministic
-        max_tokens=10000,  # Extra headroom to finish DocTags on continuation pages
-        repetition_penalty=1.05,  # Encourage Granite to keep emitting cell content
-        skip_special_tokens=False,  # Preserve DOCTAGS
-        stop=["</doctag>", "<|end_of_text|>"]  # v33: Docling's stop strings
-    )
-
-    # Force single-page batches (matches transformers.js demo) to avoid continuation loss
-    MAX_PAGES_PER_BATCH = 1
-
     total_pages = len(image_paths)
-    logger.info(
-        f"[GraniteDocling] Processing {total_pages} pages "
-        f"(max {MAX_PAGES_PER_BATCH} per batch)..."
-    )
+    logger.info(f"[GraniteDocling] Processing {total_pages} pages with transformers Granite...")
+
     inference_start = time.time()
-
-    prompt = proc.apply_chat_template(messages, add_generation_prompt=True)
-    logger.info(f"[GraniteDocling] Using prompt format: {prompt[:200]}...")
-
-    # Collect all doctags for multi-page parsing
     all_doctags: List[str] = []
 
-    try:
-        # Process pages in chunks of MAX_PAGES_PER_BATCH (vLLM inference)
-        for batch_start in range(0, total_pages, MAX_PAGES_PER_BATCH):
-            batch_end = min(batch_start + MAX_PAGES_PER_BATCH, total_pages)
-            batch_paths = image_paths[batch_start:batch_end]
-            batch_num = (batch_start // MAX_PAGES_PER_BATCH) + 1
-            total_batches = (total_pages + MAX_PAGES_PER_BATCH - 1) // MAX_PAGES_PER_BATCH
+    for page_idx, image_path in enumerate(image_paths, start=1):
+        with Image.open(image_path) as img:
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            doctags = generate_doctags_for_image(img, page_idx)
+            all_doctags.append(doctags)
 
-            logger.info(
-                f"[GraniteDocling] Batch {batch_num}/{total_batches}: "
-                f"Pages {batch_start + 1}-{batch_end}"
-            )
+    inference_time = time.time() - inference_start
+    logger.info(
+        "[GraniteDocling] Inference completed in %.2fs (%.2fs per page)",
+        inference_time,
+        inference_time / max(total_pages, 1),
+    )
 
-            # Build batch inputs for this chunk
-            batched_inputs = []
-            opened_images: List[Image.Image] = []
-            for i, image_path in enumerate(batch_paths):
-                image = load_image_as_rgb(image_path)
-                opened_images.append(image)
-                batched_inputs.append(
-                    {
-                        "prompt": prompt,
-                        "multi_modal_data": {"image": image},
-                    }
-                )
-                logger.info(f"[GraniteDocling] Added page {batch_start + i + 1} to batch")
+    logger.info("[GraniteDocling] Parsing DocTags with docling-core (multi-page mode)...")
+    parse_start = time.time()
+    combined = parse_document_with_docling_core(all_doctags, image_paths)
+    parse_time = time.time() - parse_start
+    logger.info("[GraniteDocling] docling-core parsing completed in %.2fs", parse_time)
 
-            # Single generate call for this batch
-            logger.info(
-                f"[GraniteDocling] Running batch inference for {len(batched_inputs)} pages..."
-            )
-            outputs = llm_client.generate(
-                batched_inputs,
-                sampling_params=sampling_params,
-            )
-
-            # Close PIL images immediately after inference
-            for img in opened_images:
-                try:
-                    img.close()
-                except Exception:
-                    pass
-
-            # Collect outputs for downstream parsing
-            for i, output in enumerate(outputs):
-                page_num = batch_start + i + 1
-                doctags = output.outputs[0].text or ""
-
-                logger.info(f"[GraniteDocling] Page {page_num}: {len(doctags)} chars")
-                logger.info(
-                    f"[GraniteDocling] Page {page_num} raw output (first 500 chars): "
-                    f"{doctags[:500]}"
-                )
-                logger.info(
-                    f"[GraniteDocling] Page {page_num} raw output (last 200 chars): "
-                    f"{doctags[-200:]}"
-                )
-
-                all_doctags.append(doctags)
-
-        inference_time = time.time() - inference_start
-        per_page_time = inference_time / total_pages if total_pages else 0
-        logger.info(
-            f"[GraniteDocling] vLLM inference completed in {inference_time:.2f}s "
-            f"({per_page_time:.2f}s per page)"
-        )
-
-        if len(all_doctags) != total_pages:
-            logger.warning(
-                "[GraniteDocling] Page count mismatch (doctags=%s, pages=%s). "
-                "Padding with empty DocTags.",
-                len(all_doctags),
-                total_pages,
-            )
-            while len(all_doctags) < total_pages:
-                all_doctags.append("")
-
-        logger.info(
-            f"[GraniteDocling] docling-core multi-page parse kicking off "
-            f"(pages={len(all_doctags)})"
-        )
-        parse_start = time.time()
-        combined = parse_document_with_docling_core(all_doctags, image_paths)
-        parse_time = time.time() - parse_start
-        logger.info(f"[GraniteDocling] docling-core parsing completed in {parse_time:.2f}s")
-
-        return combined, inference_time, total_pages
-
-    finally:
-        shutil.rmtree(scratch_dir, ignore_errors=True)
+    shutil.rmtree(scratch_dir, ignore_errors=True)
+    return combined, inference_time, total_pages
 
 
 def handler(event):
     """
-    RunPod serverless handler for Granite-Docling inference using direct vLLM.
+    RunPod serverless handler for Granite-Docling inference using transformers.
     """
     start_time = time.time()
 
@@ -460,7 +419,7 @@ def handler(event):
         if not pdf_base64:
             return {"status": "error", "error": "No pdf_base64 provided"}
 
-        # Process PDF with direct vLLM
+        # Process PDF with the direct transformers pipeline
         result, inference_time, page_count = process_pdf(pdf_base64)
 
         total_time = time.time() - start_time
@@ -482,8 +441,8 @@ def handler(event):
                 "raw_doctags": result.get("raw_doctags", []),
                 "metadata": {
                     "model": "granite-docling-258M",
-                    "pipeline": "direct-vllm",
-                    "framework": "vllm",
+                    "pipeline": "direct-transformers",
+                    "framework": "transformers",
                     "accelerator": "cuda",
                     "inference_time_seconds": round(inference_time, 2),
                     "total_time_seconds": round(total_time, 2),
@@ -505,7 +464,7 @@ def handler(event):
 
 
 if __name__ == "__main__":
-    logger.info("[GraniteDocling] Starting RunPod serverless handler with direct vLLM...")
+    logger.info("[GraniteDocling] Starting RunPod serverless handler with transformers...")
     logger.info("[GraniteDocling] Model: ibm-granite/granite-docling-258M (untied)")
-    logger.info("[GraniteDocling] Approach: Direct vLLM inference (IBM production recommendation)")
+    logger.info("[GraniteDocling] Approach: Direct transformers inference (Docling inline pipeline)")
     runpod.serverless.start({"handler": handler})

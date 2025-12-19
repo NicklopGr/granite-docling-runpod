@@ -1,5 +1,5 @@
 # Granite-Docling-258M RunPod Serverless Container
-# Uses IBM Docling SDK with VlmPipeline for production-quality document understanding
+# Uses HuggingFace transformers (Docling inline pipeline) for production-quality document understanding
 #
 # Build: docker build -t granite-docling-runpod .
 # Test locally: docker run --gpus all -p 8000:8000 granite-docling-runpod
@@ -23,21 +23,8 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip and build tools, then install flash-attn in same layer
-# This ensures CUDA_HOME environment is available during compilation
-RUN pip install --upgrade pip setuptools wheel && \
-    echo "=== Environment Check ===" && \
-    echo "CUDA_HOME: $CUDA_HOME" && \
-    echo "PATH: $PATH" && \
-    nvcc --version && \
-    echo "=== Installing flash-attn ===" && \
-    pip install ninja packaging && \
-    MAX_JOBS=4 pip install flash-attn --no-build-isolation -v && \
-    echo "=== Verifying flash-attn installation ===" && \
-    python -c "import flash_attn; print(f'flash-attn version: {flash_attn.__version__}')" || echo "flash-attn import failed"
-
-# Install vLLM for direct inference (IBM's recommended production approach)
-RUN pip install vllm
+# Upgrade pip and build tools
+RUN pip install --upgrade pip setuptools wheel
 
 # Install dependencies for PDF rendering and processing
 # v38: Pin docling-core==2.55.0 (latest public build) for improved continuation tables
@@ -61,8 +48,8 @@ COPY handler.py /app/handler.py
 COPY start-services.sh /app/start-services.sh
 RUN chmod +x /app/start-services.sh
 
-# Expose ports (8000 for RunPod, 8001 for vLLM)
-EXPOSE 8000 8001
+# Expose port for RunPod
+EXPOSE 8000
 
-# Run startup script (starts vLLM + handler)
+# Run startup script (starts transformers handler)
 CMD ["/app/start-services.sh"]
