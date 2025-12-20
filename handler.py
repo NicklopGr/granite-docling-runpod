@@ -17,7 +17,7 @@ Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
 - Docling inline Granite pipeline: https://docling-project.github.io/docling/
 
-Build: 2025-12-20-v41-deprecation-fixes
+Build: 2025-12-20-v42-transformers-v5
 """
 
 import runpod
@@ -103,7 +103,7 @@ def load_transformer_model():
             MODEL_NAME,
             revision=MODEL_REVISION,
             trust_remote_code=True,
-            torch_dtype=dtype_arg,  # Keep torch_dtype for now - dtype param not yet stable
+            dtype=dtype_arg,  # Updated: use dtype (not torch_dtype) per Transformers v5.0
         )
         model.to(device)
         model.eval()
