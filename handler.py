@@ -17,7 +17,7 @@ Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
 - Docling inline Granite pipeline: https://docling-project.github.io/docling/
 
-Build: 2025-12-19-v40-transformers
+Build: 2025-12-20-v41-deprecation-fixes
 """
 
 import runpod
@@ -34,7 +34,7 @@ import contextlib
 from typing import List, Dict, Any, Tuple
 from PIL import Image
 import torch
-from transformers import AutoModelForVision2Seq, AutoProcessor
+from transformers import AutoModelForImageTextToText, AutoProcessor
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -99,11 +99,11 @@ def load_transformer_model():
             MODEL_DTYPE,
         )
         dtype_arg = MODEL_DTYPE if device.type == "cuda" else torch.float32
-        model = AutoModelForVision2Seq.from_pretrained(
+        model = AutoModelForImageTextToText.from_pretrained(
             MODEL_NAME,
             revision=MODEL_REVISION,
             trust_remote_code=True,
-            torch_dtype=dtype_arg,
+            torch_dtype=dtype_arg,  # Keep torch_dtype for now - dtype param not yet stable
         )
         model.to(device)
         model.eval()
@@ -157,8 +157,7 @@ def generate_doctags_for_image(image: Image.Image, page_number: int) -> str:
 
     generation_kwargs = dict(
         max_new_tokens=2048,
-        temperature=0.0,
-        do_sample=False,
+        do_sample=False,  # Greedy decoding (temperature not supported by this model)
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
         use_cache=True,
