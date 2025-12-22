@@ -17,7 +17,7 @@ Reference:
 - https://huggingface.co/ibm-granite/granite-docling-258M
 - Docling inline Granite pipeline: https://docling-project.github.io/docling/
 
-Build: 2025-12-20-v42-transformers-v5
+Build: 2025-12-20-v43-header-positioning
 """
 
 import runpod
@@ -40,21 +40,29 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-# Prompt reminding Granite about DocTags schema (mirrors IBM reference)
+# Prompt for DocTags extraction with header-anchored column positioning
 DOC_TAG_PROMPT = """You are Docling, an AI that converts document images into DocTags.
-Follow this schema exactly:
-1. Begin with <doctag> and end with </doctag>.
-2. Emit layout tags such as <section_header_level_1>, <text>, <picture>, <otsl>, <ched>, <fcel>, <ecel>.
-3. For every table (including continuation pages):
-   - Output a single <otsl> enclosing the table coordinates.
-   - Produce header rows with <ched>.
-   - Produce every table cell with <fcel> ... </fcel> in strict row-major order.
-   - Keep textual descriptions inside the Description column. Do NOT move description text into the debit/credit cells; numeric values must stay under the debit/credit headers.
-   - Each <fcel> must contain the textual value for that cell. Never leave a cell empty and never omit debit/credit columns.
-   - Continuation pages must restate all columns (date, description, debit, credit, balance) exactly like the first page.
-4. If a source cell is blank, still emit <fcel></fcel> so downstream parsers know it was intentionally empty.
-5. Preserve reading order from top-left to bottom-right and finish only after closing </doctag>.
-Convert the provided page image into precise DocTags with complete table markup."""
+
+COLUMN POSITIONING:
+- Tables have 5 columns numbered left-to-right: Column 1, Column 2, Column 3, Column 4, Column 5
+- The HEADER ROW defines where each column is located horizontally
+- For each value in any row, look STRAIGHT UP to the header row
+- The value belongs to whichever column header is directly above it
+- Text length in other rows does NOT affect column assignment
+- Text meaning is IRRELEVANT - only vertical alignment with header determines column
+
+CRITICAL:
+- A numeric value in Column 3 stays in Column 3 regardless of text in Column 2
+- Never reassign values between columns based on content interpretation
+- If no value appears under a header for that row, emit <fcel></fcel>
+
+DOCTAGS FORMAT:
+- Wrap in <doctag>...</doctag>
+- Tables: <otsl> containing <ched> for header cells, <fcel> for data cells
+- Emit cells in strict left-to-right, top-to-bottom order
+- Multi-page tables: use the same header structure on each page
+
+Convert the image using header-aligned positioning only."""
 
 # v35: Enable TensorFloat32 tensor cores for faster float32 matrix multiplication
 # This addresses the warning: "TensorFloat32 tensor cores available but not enabled"
